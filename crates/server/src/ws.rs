@@ -39,7 +39,7 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
 
     // --- Wire up the outgoing pump ------------------------------------------
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
-    st.hub.register(&username, tx.clone());
+    let (session_id, came_online) = st.hub.register(&username, tx.clone());
 
     let mut send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -60,10 +60,19 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
         let _ = tx.send(ServerMsg::History { messages: history });
     }
 
-    // Tell everyone this user just came online.
-    st.hub.broadcast(ServerMsg::Presence { username: username.clone(), online: true });
+    // Send this client a snapshot of who is currently online.
+    for other in st.hub.online_users() {
+        if other != username {
+            let _ = tx.send(ServerMsg::Presence { username: other, online: true });
+        }
+    }
 
-    tracing::info!(%username, "client connected");
+    // Announce presence only when this is the user's first session.
+    if came_online {
+        st.hub.broadcast(ServerMsg::Presence { username: username.clone(), online: true });
+    }
+
+    tracing::info!(%username, session_id, "session connected");
 
     // --- Read loop -----------------------------------------------------------
     loop {
@@ -87,9 +96,11 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
 
     // --- Cleanup -------------------------------------------------------------
     send_task.abort();
-    st.hub.unregister(&username);
-    st.hub.broadcast(ServerMsg::Presence { username: username.clone(), online: false });
-    tracing::info!(%username, "client disconnected");
+    let went_offline = st.hub.unregister(&username, session_id);
+    if went_offline {
+        st.hub.broadcast(ServerMsg::Presence { username: username.clone(), online: false });
+    }
+    tracing::info!(%username, session_id, "session disconnected");
 }
 
 /// Wait for the first valid Auth frame. Returns the authenticated username.
@@ -147,10 +158,12 @@ async fn handle_client_msg(
                 return true;
             }
 
-            // Deliver to the recipient if online, and echo back to the sender
-            // so their own UI shows the sent message.
-            st.hub.send_to(&to, ServerMsg::Dm(dm.clone()));
-            let _ = self_tx.send(ServerMsg::Dm(dm));
+            // Deliver to every session of the recipient, and echo to every
+            // session of the sender (so all their terminals stay in sync).
+            st.hub.send_to_user(&to, ServerMsg::Dm(dm.clone()));
+            if to != username {
+                st.hub.send_to_user(username, ServerMsg::Dm(dm));
+            }
         }
     }
     true

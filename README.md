@@ -41,12 +41,20 @@ cargo run -p client -- http://my-host:8080   # or a custom server
 
 In the client:
 
-- **Login screen:** type a username/password, `Tab` switches field, `Ctrl+R`
-  toggles login/register, `Enter` submits.
-- **Chat screen:** `/dm <user>` opens a conversation, then just type and press
-  `Enter`. `/help` lists commands, `/quit` (or `Esc`) exits.
+- **Accounts screen** (shown when you have saved accounts): `↑/↓` to pick,
+  `Enter` to connect with the saved token, `a` to add another, `d` to delete,
+  `q` to quit. You can also click a row.
+- **Login screen:** `server`/`user`/`pass` fields — `Tab` switches field,
+  `Ctrl+R` toggles login/register, `Enter` submits. Successful logins are saved
+  to the account store (`~/.config/clicord/sessions.json`).
+- **Chat screen:** `/dm <user>` opens a conversation (or **click a name** in the
+  list), then type and press `Enter`. Autocomplete: start a `/` command and
+  press `Tab` to complete commands or, after `/dm `, usernames by prefix.
+  `/help` lists commands, `/quit` (or `Esc`) exits.
 
-Open two clients, register two users, `/dm` each other and chat.
+The same account can be open in several terminals at once — messages stay in
+sync across all of them. Open two clients, register two users, `/dm` each other
+and chat.
 
 ## Configuration (env vars)
 
