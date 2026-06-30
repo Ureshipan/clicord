@@ -1,0 +1,23 @@
+name: clicord
+dockerfile: ./Dockerfile
+domain: clicord                 # served at clicord.<base-domain>
+
+ports:
+  - container: 8080            # axum HTTP + websocket; host port assigned by samoswallow
+
+env:
+  CLICORD_LISTEN: "0.0.0.0:8080"
+  CLICORD_DB: "sqlite:///data/clicord.db"
+  CLICORD_JWT_SECRET: "change-me-set-a-real-secret-in-the-ui"   # override in the UI
+
+resources:
+  cpu: "0.5"
+  memory: "256m"
+
+healthcheck:
+  path: /health
+
+scale:
+  # The presence/routing hub is in-memory, so keep a single instance for now.
+  # Horizontal scaling will need a shared bus (e.g. Redis) first.
+  default_instances: 1
