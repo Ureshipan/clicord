@@ -24,6 +24,13 @@ pub struct Store {
     pub accounts: Vec<Account>,
 }
 
+/// Application-level config, separate from the account store. Holds the server
+/// address entered on first run.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Config {
+    pub server: Option<String>,
+}
+
 impl Store {
     /// Insert or replace the account matched by (server, username).
     pub fn upsert(&mut self, account: Account) {
@@ -45,8 +52,37 @@ impl Store {
     }
 }
 
+fn config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("clicord"))
+}
+
 fn store_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("clicord").join("sessions.json"))
+    config_dir().map(|d| d.join("sessions.json"))
+}
+
+fn config_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("config.json"))
+}
+
+/// Load the app config; returns an empty config if missing or unreadable.
+pub fn load_config() -> Config {
+    let Some(path) = config_path() else {
+        return Config::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => Config::default(),
+    }
+}
+
+pub fn save_config(config: &Config) {
+    let Some(path) = config_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(config) {
+        let _ = std::fs::write(&path, text);
+    }
 }
 
 /// Load the account store; returns an empty store if missing or unreadable.

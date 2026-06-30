@@ -35,22 +35,29 @@ CLICORD_JWT_SECRET=dev-secret cargo run -p server
 Terminal 2 (and 3, 4, …) — one client per user:
 
 ```sh
-cargo run -p client            # connects to http://127.0.0.1:8080
-cargo run -p client -- http://my-host:8080   # or a custom server
+cargo run -p client                  # on first run it asks for the server address
+cargo run -p client -- http://host   # optional: prefill the address on first run
 ```
+
+The server address is asked once on first run and saved to
+`~/.config/clicord/config.json`; the CLI argument only prefills it. Change it
+later from the connection-error screen.
 
 In the client:
 
-- **Accounts screen** (shown when you have saved accounts): `↑/↓` to pick,
-  `Enter` to connect with the saved token, `a` to add another, `d` to delete,
-  `q` to quit. You can also click a row.
-- **Login screen:** `server`/`user`/`pass` fields — `Tab` switches field,
-  `Ctrl+R` toggles login/register, `Enter` submits. Successful logins are saved
-  to the account store (`~/.config/clicord/sessions.json`).
-- **Chat screen:** `/dm <user>` opens a conversation (or **click a name** in the
-  list), then type and press `Enter`. Autocomplete: start a `/` command and
-  press `Tab` to complete commands or, after `/dm `, usernames by prefix.
-  `/help` lists commands, `/quit` (or `Esc`) exits.
+- **Server setup** (first run): type the address, `Enter` to save.
+- **Accounts screen:** `↑/↓` to pick, `Enter` to connect with the saved token,
+  `a` to add another, `d` to delete, `q` to quit. You can also click a row.
+- **Login screen:** `user`/`pass` fields — `Tab` switches field, `Ctrl+R`
+  toggles login/register, `Enter` submits. Logins are saved to the account
+  store (`~/.config/clicord/sessions.json`).
+- **Chat screen:** `/dm <user>` opens a conversation (or **click a name**), then
+  type and `Enter`. `Tab` autocompletes commands and, after `/dm `, usernames.
+  Edit with `←/→`, `Home/End`, `Delete`. Unread chats show a red badge. `Esc` or
+  `/accounts` returns to the session manager.
+- **Connection lost / unreachable:** a screen offers `r` retry, `s` change
+  server, `a` accounts, `q` quit.
+- **`F1`** shows all commands and keybindings; **`Ctrl+Q`** quits from anywhere.
 
 The same account can be open in several terminals at once — messages stay in
 sync across all of them. Open two clients, register two users, `/dm` each other

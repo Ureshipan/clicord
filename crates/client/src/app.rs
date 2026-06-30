@@ -4,16 +4,27 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use protocol::{ClientMsg, DirectMessage, ServerMsg};
 use ratatui::layout::Rect;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::session::{self, Account, Store};
-use crate::{layout, net};
+use crate::input::TextInput;
+use crate::net::{self, Incoming};
+use crate::session::{self, Account, Config, Store};
+use crate::layout;
 
 pub enum Screen {
+    ServerSetup,
     Accounts,
     Login,
     Chat,
+    ConnError,
+}
+
+/// Where the server-setup screen returns to once an address is entered.
+#[derive(Clone, Copy)]
+enum SetupReturn {
+    Start,
+    Reconnect,
 }
 
 #[derive(Clone, Copy)]
@@ -24,83 +35,113 @@ pub enum LoginMode {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum LoginField {
-    Server,
     Username,
     Password,
 }
 
-const COMMANDS: &[&str] = &["dm", "quit", "help"];
+#[derive(Clone)]
+struct PendingConn {
+    server: String,
+    username: String,
+    token: String,
+}
+
+const COMMANDS: &[&str] = &["dm", "accounts", "help", "quit"];
 
 pub struct App {
-    pub default_server: String,
+    pub config: Config,
+    pub store: Store,
     pub screen: Screen,
     pub should_quit: bool,
     pub status: String,
+    pub show_help: bool,
+
+    setup_return: SetupReturn,
 
     // account manager
-    pub store: Store,
     pub accounts_idx: usize,
 
-    // login screen
+    // server setup
+    pub server_input: TextInput,
+
+    // login
     pub login_mode: LoginMode,
     pub login_field: LoginField,
-    pub login_server: String,
-    pub username_input: String,
-    pub password_input: String,
+    pub username_input: TextInput,
+    pub password_input: TextInput,
 
-    // chat screen
+    // chat
     pub username: String,
     pub server: String,
     pub authed: bool,
     pub active_peer: String,
-    pub input: String,
+    pub input: TextInput,
     pub messages: Vec<DirectMessage>,
     pub peers: BTreeSet<String>,
     pub online: BTreeSet<String>,
+    pub unread: BTreeMap<String, u32>,
 
     // autocomplete
     pub suggestions: Vec<String>,
-    pub suggestion_idx: usize,
+    pub selected: Option<usize>,
 
-    // networking
-    in_tx: UnboundedSender<ServerMsg>,
+    // connection retry context
+    pending: Option<PendingConn>,
+    auth_failed: bool,
+
+    in_tx: UnboundedSender<Incoming>,
     out_tx: Option<UnboundedSender<ClientMsg>>,
 }
 
 impl App {
-    pub fn new(default_server: String, store: Store, in_tx: UnboundedSender<ServerMsg>) -> Self {
-        let screen = if store.accounts.is_empty() {
-            Screen::Login
+    pub fn new(default_server: String, config: Config, store: Store, in_tx: UnboundedSender<Incoming>) -> Self {
+        let (screen, status, server_input) = if config.server.is_none() {
+            (
+                Screen::ServerSetup,
+                "first run — enter the clicord server address".to_string(),
+                TextInput::with(default_server),
+            )
+        } else if store.accounts.is_empty() {
+            (
+                Screen::Login,
+                "no saved accounts — register or log in".to_string(),
+                TextInput::default(),
+            )
         } else {
-            Screen::Accounts
+            (
+                Screen::Accounts,
+                "select an account · Enter connect · a add · d delete".to_string(),
+                TextInput::default(),
+            )
         };
-        let status = if store.accounts.is_empty() {
-            "no saved accounts — register or log in".into()
-        } else {
-            "select an account · Enter connect · a add · d delete".into()
-        };
+
         Self {
-            login_server: default_server.clone(),
-            default_server,
+            config,
+            store,
             screen,
             should_quit: false,
             status,
-            store,
+            show_help: false,
+            setup_return: SetupReturn::Start,
             accounts_idx: 0,
+            server_input,
             login_mode: LoginMode::Login,
             login_field: LoginField::Username,
-            username_input: String::new(),
-            password_input: String::new(),
+            username_input: TextInput::default(),
+            password_input: TextInput::default(),
             username: String::new(),
             server: String::new(),
             authed: false,
             active_peer: String::new(),
-            input: String::new(),
+            input: TextInput::default(),
             messages: Vec::new(),
             peers: BTreeSet::new(),
             online: BTreeSet::new(),
+            unread: BTreeMap::new(),
             suggestions: Vec::new(),
-            suggestion_idx: 0,
+            selected: None,
+            pending: None,
+            auth_failed: false,
             in_tx,
             out_tx: None,
         }
@@ -109,10 +150,84 @@ impl App {
     // === Key handling =======================================================
 
     pub async fn on_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // Global: quit and help work from any screen.
+        if ctrl && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+            self.should_quit = true;
+            return;
+        }
+        if self.show_help {
+            // While the help overlay is up, most keys just dismiss it.
+            if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter) {
+                self.show_help = false;
+            }
+            return;
+        }
+        if key.code == KeyCode::F(1) {
+            self.show_help = true;
+            return;
+        }
+
         match self.screen {
+            Screen::ServerSetup => self.server_setup_key(key, ctrl),
             Screen::Accounts => self.accounts_key(key),
-            Screen::Login => self.login_key(key).await,
-            Screen::Chat => self.chat_key(key),
+            Screen::Login => self.login_key(key, ctrl).await,
+            Screen::Chat => self.chat_key(key, ctrl),
+            Screen::ConnError => self.conn_error_key(key),
+        }
+    }
+
+    // --- Server setup -------------------------------------------------------
+
+    fn server_setup_key(&mut self, key: KeyEvent, ctrl: bool) {
+        match key.code {
+            KeyCode::Esc => match self.setup_return {
+                SetupReturn::Start => self.should_quit = true,
+                SetupReturn::Reconnect => self.screen = Screen::ConnError,
+            },
+            KeyCode::Enter => self.submit_server_setup(),
+            _ => {
+                edit_key(&mut self.server_input, key, ctrl);
+            }
+        }
+    }
+
+    fn submit_server_setup(&mut self) {
+        let server = match normalize_server(self.server_input.value()) {
+            Some(s) => s,
+            None => {
+                self.status = "address cannot be empty".into();
+                return;
+            }
+        };
+        self.config.server = Some(server.clone());
+        session::save_config(&self.config);
+
+        match self.setup_return {
+            SetupReturn::Start => {
+                if self.store.accounts.is_empty() {
+                    self.open_login();
+                } else {
+                    self.go_to_accounts();
+                }
+            }
+            SetupReturn::Reconnect => {
+                // Re-point the pending account at the new address and retry.
+                if let Some(p) = self.pending.as_mut() {
+                    p.server = server.clone();
+                }
+                if let Some(acct) = self
+                    .store
+                    .accounts
+                    .iter_mut()
+                    .find(|a| Some(&a.username) == self.pending.as_ref().map(|p| &p.username))
+                {
+                    acct.server = server;
+                    session::save(&self.store);
+                }
+                self.retry();
+            }
         }
     }
 
@@ -151,11 +266,17 @@ impl App {
         }
     }
 
+    fn go_to_accounts(&mut self) {
+        self.out_tx = None;
+        self.authed = false;
+        self.screen = Screen::Accounts;
+        self.status = "select an account · Enter connect · a add · d delete".into();
+    }
+
     fn open_login(&mut self) {
         self.screen = Screen::Login;
         self.login_mode = LoginMode::Login;
         self.login_field = LoginField::Username;
-        self.login_server = self.default_server.clone();
         self.username_input.clear();
         self.password_input.clear();
         self.status = "enter credentials · Ctrl+R toggles login/register".into();
@@ -169,21 +290,19 @@ impl App {
 
     // --- Login screen -------------------------------------------------------
 
-    async fn login_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    async fn login_key(&mut self, key: KeyEvent, ctrl: bool) {
         match key.code {
             KeyCode::Esc => {
                 if self.store.accounts.is_empty() {
                     self.should_quit = true;
                 } else {
-                    self.screen = Screen::Accounts;
+                    self.go_to_accounts();
                 }
             }
             KeyCode::Tab => {
                 self.login_field = match self.login_field {
-                    LoginField::Server => LoginField::Username,
                     LoginField::Username => LoginField::Password,
-                    LoginField::Password => LoginField::Server,
+                    LoginField::Password => LoginField::Username,
                 }
             }
             KeyCode::Char('r') | KeyCode::Char('R') if ctrl => {
@@ -193,38 +312,36 @@ impl App {
                 }
             }
             KeyCode::Enter => self.submit_login().await,
-            KeyCode::Backspace => {
-                self.login_field_mut().pop();
+            _ => {
+                let field = match self.login_field {
+                    LoginField::Username => &mut self.username_input,
+                    LoginField::Password => &mut self.password_input,
+                };
+                edit_key(field, key, ctrl);
             }
-            KeyCode::Char(c) if !ctrl => self.login_field_mut().push(c),
-            _ => {}
-        }
-    }
-
-    fn login_field_mut(&mut self) -> &mut String {
-        match self.login_field {
-            LoginField::Server => &mut self.login_server,
-            LoginField::Username => &mut self.username_input,
-            LoginField::Password => &mut self.password_input,
         }
     }
 
     async fn submit_login(&mut self) {
+        let Some(server) = self.config.server.clone() else {
+            self.status = "no server configured".into();
+            return;
+        };
         let path = match self.login_mode {
             LoginMode::Login => "login",
             LoginMode::Register => "register",
         };
         self.status = "connecting…".into();
-        match net::auth(&self.login_server, path, &self.username_input, &self.password_input).await {
+        match net::auth(&server, path, self.username_input.value(), self.password_input.value()).await {
             Ok(resp) => {
                 self.store.upsert(Account {
-                    server: self.login_server.clone(),
+                    server: server.clone(),
                     username: resp.username.clone(),
                     token: resp.token.clone(),
                 });
                 session::save(&self.store);
                 self.password_input.clear();
-                self.connect(self.login_server.clone(), resp.username, resp.token);
+                self.connect(server, resp.username, resp.token);
             }
             Err(e) => self.status = format!("auth failed: {e}"),
         }
@@ -232,30 +349,25 @@ impl App {
 
     // --- Chat screen --------------------------------------------------------
 
-    fn chat_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    fn chat_key(&mut self, key: KeyEvent, ctrl: bool) {
         match key.code {
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => self.go_to_accounts(),
             KeyCode::Tab => self.apply_suggestion(),
             KeyCode::Enter => {
                 self.submit_chat();
                 self.recompute_suggestions();
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-                self.recompute_suggestions();
+            _ => {
+                if edit_key(&mut self.input, key, ctrl) {
+                    self.recompute_suggestions();
+                }
             }
-            KeyCode::Char(c) if !ctrl => {
-                self.input.push(c);
-                self.recompute_suggestions();
-            }
-            _ => {}
         }
     }
 
     fn submit_chat(&mut self) {
-        let line = std::mem::take(&mut self.input);
-        let line = line.trim();
+        let line = self.input.value().trim().to_string();
+        self.input.clear();
         if line.is_empty() {
             return;
         }
@@ -270,7 +382,7 @@ impl App {
         if let Some(tx) = &self.out_tx {
             let _ = tx.send(ClientMsg::SendDm {
                 to: self.active_peer.clone(),
-                body: line.to_string(),
+                body: line,
             });
         }
     }
@@ -282,28 +394,61 @@ impl App {
                 Some(user) => self.open_chat_with(user.to_string()),
                 None => self.status = "usage: /dm <user>".into(),
             },
+            Some("accounts") | Some("sessions") => self.go_to_accounts(),
             Some("quit") | Some("q") => self.should_quit = true,
-            Some("help") => self.status = "/dm <user> · /quit · Tab completes · click a name".into(),
-            _ => self.status = "unknown command (try /help)".into(),
+            Some("help") => self.show_help = true,
+            _ => self.status = "unknown command (try /help or F1)".into(),
         }
     }
 
     fn open_chat_with(&mut self, user: String) {
         self.peers.insert(user.clone());
+        self.unread.remove(&user);
         self.active_peer = user;
         self.status = format!("now chatting with {}", self.active_peer);
+    }
+
+    // --- Connection error screen -------------------------------------------
+
+    fn conn_error_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => self.retry(),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.setup_return = SetupReturn::Reconnect;
+                self.server_input = TextInput::with(self.config.server.clone().unwrap_or_default());
+                self.screen = Screen::ServerSetup;
+                self.status = "enter the new server address".into();
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Esc => self.go_to_accounts(),
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            _ => {}
+        }
+    }
+
+    fn enter_conn_error(&mut self, message: String) {
+        self.out_tx = None;
+        self.authed = false;
+        self.screen = Screen::ConnError;
+        self.status = format!("connection failed: {message}");
+    }
+
+    fn retry(&mut self) {
+        if let Some(p) = self.pending.clone() {
+            self.connect(p.server, p.username, p.token);
+        } else {
+            self.go_to_accounts();
+        }
     }
 
     // --- Autocomplete -------------------------------------------------------
 
     fn recompute_suggestions(&mut self) {
         self.suggestions.clear();
-        self.suggestion_idx = 0;
-        let Some(rest) = self.input.strip_prefix('/') else {
+        self.selected = None; // nothing highlighted until the user presses Tab
+        let Some(rest) = self.input.value().strip_prefix('/') else {
             return;
         };
         match rest.split_once(' ') {
-            // Still typing the command word.
             None => {
                 for c in COMMANDS {
                     if c.starts_with(rest) {
@@ -311,7 +456,6 @@ impl App {
                     }
                 }
             }
-            // Completing an argument.
             Some((cmd, arg)) if cmd == "dm" || cmd == "to" => {
                 for u in self.known_users() {
                     if u != self.username && u.starts_with(arg) {
@@ -331,14 +475,18 @@ impl App {
         if self.suggestions.is_empty() {
             return;
         }
-        self.input = self.suggestions[self.suggestion_idx].clone();
-        self.suggestion_idx = (self.suggestion_idx + 1) % self.suggestions.len();
+        let next = match self.selected {
+            None => 0,
+            Some(i) => (i + 1) % self.suggestions.len(),
+        };
+        self.selected = Some(next);
+        self.input.set(self.suggestions[next].clone());
     }
 
     // === Mouse handling =====================================================
 
     pub fn on_mouse(&mut self, ev: MouseEvent) {
-        if ev.kind != MouseEventKind::Down(MouseButton::Left) {
+        if ev.kind != MouseEventKind::Down(MouseButton::Left) || self.show_help {
             return;
         }
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -352,7 +500,6 @@ impl App {
             }
             Screen::Accounts => {
                 let list = layout::accounts_list(area);
-                // Items start one row below the top border.
                 if ev.row > list.y && ev.row < list.y + list.height.saturating_sub(1) {
                     let idx = (ev.row - list.y - 1) as usize;
                     if idx < self.store.accounts.len() {
@@ -361,17 +508,31 @@ impl App {
                     }
                 }
             }
-            Screen::Login => {}
+            _ => {}
         }
     }
 
-    // === Incoming server events ============================================
+    // === Incoming events from the network task =============================
 
-    pub fn on_server_msg(&mut self, msg: ServerMsg) {
+    pub fn on_incoming(&mut self, ev: Incoming) {
+        match ev {
+            Incoming::Server(msg) => self.on_server_msg(msg),
+            Incoming::ConnectFailed(m) | Incoming::Disconnected(m) => {
+                // Ignore drops that arrive after we already left the chat (e.g.
+                // an intentional disconnect, or a token rejection already routed
+                // to the login screen).
+                if matches!(self.screen, Screen::Chat) && !self.auth_failed {
+                    self.enter_conn_error(m);
+                }
+            }
+        }
+    }
+
+    fn on_server_msg(&mut self, msg: ServerMsg) {
         match msg {
             ServerMsg::AuthOk { username } => {
                 self.authed = true;
-                self.status = format!("online as {username} · /help for commands");
+                self.status = format!("online as {username} · F1 for help");
             }
             ServerMsg::History { messages } => {
                 for m in messages {
@@ -381,8 +542,12 @@ impl App {
             }
             ServerMsg::Dm(m) => {
                 self.note_peer(&m);
+                let peer = self.other_party(&m);
                 if self.active_peer.is_empty() {
-                    self.active_peer = self.other_party(&m);
+                    self.active_peer = peer.clone();
+                    self.unread.remove(&peer);
+                } else if m.from != self.username && peer != self.active_peer {
+                    *self.unread.entry(peer).or_insert(0) += 1;
                 }
                 self.messages.push(m);
             }
@@ -394,16 +559,12 @@ impl App {
                 }
             }
             ServerMsg::Error { message } => {
-                // A failure before we ever authenticated means a bad/expired
-                // token — drop back to the account picker.
                 if !self.authed && matches!(self.screen, Screen::Chat) {
+                    // Rejected before we authenticated — bad/expired token.
+                    self.auth_failed = true;
                     self.out_tx = None;
-                    self.screen = if self.store.accounts.is_empty() {
-                        Screen::Login
-                    } else {
-                        Screen::Accounts
-                    };
-                    self.status = format!("session ended ({message}) — log in again");
+                    self.open_login();
+                    self.status = format!("session rejected ({message}) — log in again");
                 } else {
                     self.status = format!("server: {message}");
                 }
@@ -427,7 +588,6 @@ impl App {
         }
     }
 
-    /// Messages belonging to the currently open conversation, oldest first.
     pub fn messages_for_active(&self) -> Vec<&DirectMessage> {
         if self.active_peer.is_empty() {
             return Vec::new();
@@ -444,19 +604,75 @@ impl App {
     // === Session wiring =====================================================
 
     fn connect(&mut self, server: String, username: String, token: String) {
+        self.pending = Some(PendingConn {
+            server: server.clone(),
+            username: username.clone(),
+            token: token.clone(),
+        });
         self.username = username;
         self.server = server.clone();
         self.authed = false;
+        self.auth_failed = false;
         self.active_peer.clear();
         self.messages.clear();
         self.peers.clear();
         self.online.clear();
+        self.unread.clear();
         self.input.clear();
         self.suggestions.clear();
-        self.suggestion_idx = 0;
+        self.selected = None;
         self.out_tx = Some(net::spawn_ws(server, token, self.in_tx.clone()));
         self.screen = Screen::Chat;
         self.status = "connecting…".into();
+    }
+}
+
+/// Apply a text-editing / cursor key to a field. Returns true if the text
+/// content changed (so callers can refresh autocomplete).
+fn edit_key(field: &mut TextInput, key: KeyEvent, ctrl: bool) -> bool {
+    match key.code {
+        KeyCode::Char(c) if !ctrl => {
+            field.insert(c);
+            true
+        }
+        KeyCode::Backspace => {
+            field.backspace();
+            true
+        }
+        KeyCode::Delete => {
+            field.delete();
+            true
+        }
+        KeyCode::Left => {
+            field.left();
+            false
+        }
+        KeyCode::Right => {
+            field.right();
+            false
+        }
+        KeyCode::Home => {
+            field.home();
+            false
+        }
+        KeyCode::End => {
+            field.end();
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Trim and ensure the address has a scheme; `None` if empty.
+fn normalize_server(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains("://") {
+        Some(s.to_string())
+    } else {
+        Some(format!("http://{s}"))
     }
 }
 
@@ -477,13 +693,14 @@ mod tests {
 
     fn test_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new("http://x".into(), Store::default(), tx)
+        let config = Config { server: Some("http://x".into()) };
+        App::new("http://x".into(), config, Store::default(), tx)
     }
 
     #[test]
     fn completes_command_names() {
         let mut a = test_app();
-        a.input = "/d".into();
+        a.input.set("/d");
         a.recompute_suggestions();
         assert_eq!(a.suggestions, vec!["/dm"]);
     }
@@ -495,32 +712,46 @@ mod tests {
         for u in ["alice", "alex", "bob", "me"] {
             a.peers.insert(u.into());
         }
-        a.input = "/dm al".into();
+        a.input.set("/dm al");
         a.recompute_suggestions();
-        // BTreeSet order: "alex" < "alice"; "me" excluded.
         assert_eq!(a.suggestions, vec!["/dm alex", "/dm alice"]);
     }
 
     #[test]
-    fn tab_cycles_through_suggestions() {
+    fn nothing_highlighted_until_tab() {
         let mut a = test_app();
         a.peers.insert("alice".into());
-        a.peers.insert("alex".into());
-        a.input = "/dm al".into();
+        a.input.set("/dm al");
         a.recompute_suggestions();
+        assert_eq!(a.selected, None); // popup shows, but no selection yet
         a.apply_suggestion();
-        assert_eq!(a.input, "/dm alex");
-        a.apply_suggestion();
-        assert_eq!(a.input, "/dm alice");
-        a.apply_suggestion();
-        assert_eq!(a.input, "/dm alex"); // wraps around
+        assert_eq!(a.selected, Some(0));
+        assert_eq!(a.input.value(), "/dm alice");
     }
 
     #[test]
-    fn no_suggestions_without_slash() {
+    fn unread_counts_for_other_chats_only() {
         let mut a = test_app();
-        a.input = "hello".into();
-        a.recompute_suggestions();
-        assert!(a.suggestions.is_empty());
+        a.username = "me".into();
+        a.active_peer = "bob".into();
+        // message from alice while talking to bob -> unread for alice
+        a.on_server_msg(ServerMsg::Dm(DirectMessage {
+            from: "alice".into(),
+            to: "me".into(),
+            body: "hi".into(),
+            ts: 0,
+        }));
+        assert_eq!(a.unread.get("alice"), Some(&1));
+        // message from bob (active) -> no unread
+        a.on_server_msg(ServerMsg::Dm(DirectMessage {
+            from: "bob".into(),
+            to: "me".into(),
+            body: "yo".into(),
+            ts: 0,
+        }));
+        assert_eq!(a.unread.get("bob"), None);
+        // opening alice clears her unread
+        a.open_chat_with("alice".into());
+        assert_eq!(a.unread.get("alice"), None);
     }
 }

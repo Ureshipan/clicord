@@ -5,6 +5,7 @@
 //! saved accounts remember their own server.
 
 mod app;
+mod input;
 mod layout;
 mod net;
 mod session;
@@ -18,7 +19,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
-use protocol::ServerMsg;
+use net::Incoming;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 use std::io::stdout;
@@ -44,9 +45,10 @@ async fn main() -> Result<()> {
 }
 
 async fn run<B: Backend>(terminal: &mut Terminal<B>, default_server: String) -> Result<()> {
+    let config = session::load_config();
     let store = session::load();
-    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<ServerMsg>();
-    let mut app = App::new(default_server, store, in_tx);
+    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Incoming>();
+    let mut app = App::new(default_server, config, store, in_tx);
     let mut events = EventStream::new();
 
     while !app.should_quit {
@@ -59,7 +61,7 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, default_server: String) -> 
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
             },
-            Some(server_msg) = in_rx.recv() => app.on_server_msg(server_msg),
+            Some(incoming) = in_rx.recv() => app.on_incoming(incoming),
         }
     }
     Ok(())

@@ -14,10 +14,46 @@ const ACCENT: Color = Color::Cyan;
 
 pub fn render(f: &mut Frame, app: &App) {
     match app.screen {
+        Screen::ServerSetup => render_server_setup(f, app),
         Screen::Accounts => render_accounts(f, app),
         Screen::Login => render_login(f, app),
         Screen::Chat => render_chat(f, app),
+        Screen::ConnError => render_conn_error(f, app),
     }
+    if app.show_help {
+        render_help(f);
+    }
+}
+
+// === Server setup ===========================================================
+
+fn render_server_setup(f: &mut Frame, app: &App) {
+    let area = f.area();
+    f.render_widget(framed(" clicord · server "), area);
+
+    let inner = centered_rect(64, 5, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(field_line("address", app.server_input.value(), true), rows[0]);
+    f.render_widget(
+        Paragraph::new(app.status.clone()).style(Style::default().fg(Color::Yellow)),
+        rows[2],
+    );
+    f.render_widget(
+        Paragraph::new("Enter: save · Esc: back · e.g. http://host:8080")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[3],
+    );
+
+    set_field_cursor(f, rows[0], "address", app.server_input.cursor());
 }
 
 // === Accounts ===============================================================
@@ -59,16 +95,16 @@ fn render_accounts(f: &mut Frame, app: &App) {
         chunks[0],
     );
 
-    let hints = Line::from(vec![
-        Span::styled(&app.status, Style::default().fg(Color::Yellow)),
-    ]);
     let footer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(chunks[1]);
-    f.render_widget(Paragraph::new(hints), footer[0]);
     f.render_widget(
-        Paragraph::new("↑/↓ select · Enter connect · a add · d delete · q quit · click a row")
+        Paragraph::new(app.status.clone()).style(Style::default().fg(Color::Yellow)),
+        footer[0],
+    );
+    f.render_widget(
+        Paragraph::new("↑/↓ select · Enter connect · a add · d delete · q quit · F1 help")
             .style(Style::default().fg(Color::DarkGray)),
         footer[1],
     );
@@ -78,21 +114,14 @@ fn render_accounts(f: &mut Frame, app: &App) {
 
 fn render_login(f: &mut Frame, app: &App) {
     let area = f.area();
-    f.render_widget(
-        Block::default()
-            .title(" clicord · login ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT)),
-        area,
-    );
+    f.render_widget(framed(" clicord · login "), area);
 
-    let inner = centered_rect(64, 9, area);
+    let inner = centered_rect(64, 7, area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // mode
             Constraint::Length(1), // spacer
-            Constraint::Length(1), // server
             Constraint::Length(1), // user
             Constraint::Length(1), // pass
             Constraint::Length(1), // spacer
@@ -105,49 +134,34 @@ fn render_login(f: &mut Frame, app: &App) {
         LoginMode::Login => "LOGIN",
         LoginMode::Register => "REGISTER",
     };
+    let server = app.config.server.clone().unwrap_or_default();
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::raw("mode: "),
             Span::styled(mode, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  @ {server}"), Style::default().fg(Color::DarkGray)),
         ])),
         rows[0],
     );
 
-    let masked = "*".repeat(app.password_input.chars().count());
-    f.render_widget(field_line("server", &app.login_server, app.login_field == LoginField::Server), rows[2]);
-    f.render_widget(field_line("user", &app.username_input, app.login_field == LoginField::Username), rows[3]);
-    f.render_widget(field_line("pass", &masked, app.login_field == LoginField::Password), rows[4]);
+    let masked = "*".repeat(app.password_input.len());
+    f.render_widget(field_line("user", app.username_input.value(), app.login_field == LoginField::Username), rows[2]);
+    f.render_widget(field_line("pass", &masked, app.login_field == LoginField::Password), rows[3]);
 
     f.render_widget(
         Paragraph::new(app.status.clone()).style(Style::default().fg(Color::Yellow)),
-        rows[6],
+        rows[5],
     );
     f.render_widget(
         Paragraph::new("Tab: field · Ctrl+R: mode · Enter: submit · Esc: back")
             .style(Style::default().fg(Color::DarkGray)),
-        rows[7],
+        rows[6],
     );
 
-    // Place the real cursor at the end of the focused field.
-    let (label, len, row) = match app.login_field {
-        LoginField::Server => ("server", app.login_server.chars().count(), rows[2]),
-        LoginField::Username => ("user", app.username_input.chars().count(), rows[3]),
-        LoginField::Password => ("pass", masked.chars().count(), rows[4]),
+    let (label, field, row) = match app.login_field {
+        LoginField::Username => ("user", &app.username_input, rows[2]),
+        LoginField::Password => ("pass", &app.password_input, rows[3]),
     };
-    let prefix = (2 + label.len() + 2) as u16; // "> " + label + ": "
-    f.set_cursor_position(Position::new(row.x + prefix + len as u16, row.y));
-}
-
-fn field_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
-    let (marker, style) = if focused {
-        ("> ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
-    } else {
-        ("  ", Style::default().fg(Color::Gray))
-    };
-    Paragraph::new(Line::from(vec![
-        Span::styled(format!("{marker}{label}: "), style),
-        Span::raw(value.to_string()),
-    ]))
+    set_field_cursor(f, row, label, field.cursor());
 }
 
 // === Chat ===================================================================
@@ -155,7 +169,6 @@ fn field_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
 fn render_chat(f: &mut Frame, app: &App) {
     let l = layout::chat_layout(f.area());
 
-    // Header
     let peer = if app.active_peer.is_empty() {
         "(no chat)".to_string()
     } else {
@@ -173,7 +186,7 @@ fn render_chat(f: &mut Frame, app: &App) {
         l.header,
     );
 
-    // Peers list
+    // Peers list with unread counters.
     let items: Vec<ListItem> = app
         .peers
         .iter()
@@ -187,7 +200,14 @@ fn render_chat(f: &mut Frame, app: &App) {
                 Style::default().fg(Color::Gray)
             };
             let dot = if online { "●" } else { "○" };
-            ListItem::new(Line::from(Span::styled(format!("{dot} {p}"), style)))
+            let mut spans = vec![Span::styled(format!("{dot} {p}"), style)];
+            if let Some(n) = app.unread.get(p).filter(|n| **n > 0) {
+                spans.push(Span::styled(
+                    format!(" ({n})"),
+                    Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     f.render_widget(
@@ -216,9 +236,9 @@ fn render_chat(f: &mut Frame, app: &App) {
         l.messages,
     );
 
-    // Input box — focused, so accent border + live cursor.
+    // Input box — focused, accent border + live cursor.
     f.render_widget(
-        Paragraph::new(app.input.as_str()).block(
+        Paragraph::new(app.input.value()).block(
             Block::default()
                 .title(" message ")
                 .borders(Borders::ALL)
@@ -226,11 +246,10 @@ fn render_chat(f: &mut Frame, app: &App) {
         ),
         l.input,
     );
-    let cursor_x = (l.input.x + 1 + app.input.chars().count() as u16)
+    let cursor_x = (l.input.x + 1 + app.input.cursor() as u16)
         .min(l.input.x + l.input.width.saturating_sub(2));
     f.set_cursor_position(Position::new(cursor_x, l.input.y + 1));
 
-    // Autocomplete popup, floating just above the input.
     if !app.suggestions.is_empty() {
         render_suggestions(f, app, l.input);
     }
@@ -238,7 +257,7 @@ fn render_chat(f: &mut Frame, app: &App) {
 
 fn render_suggestions(f: &mut Frame, app: &App, input: Rect) {
     let count = app.suggestions.len().min(6) as u16;
-    let height = count + 2; // borders
+    let height = count + 2;
     if input.y < height {
         return;
     }
@@ -250,7 +269,7 @@ fn render_suggestions(f: &mut Frame, app: &App, input: Rect) {
         .take(6)
         .enumerate()
         .map(|(i, s)| {
-            let style = if i == app.suggestion_idx {
+            let style = if Some(i) == app.selected {
                 Style::default().fg(Color::Black).bg(ACCENT)
             } else {
                 Style::default().fg(Color::Gray)
@@ -269,6 +288,114 @@ fn render_suggestions(f: &mut Frame, app: &App, input: Rect) {
         ),
         rect,
     );
+}
+
+// === Connection error =======================================================
+
+fn render_conn_error(f: &mut Frame, app: &App) {
+    let area = f.area();
+    f.render_widget(
+        Block::default()
+            .title(" connection problem ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red)),
+        area,
+    );
+
+    let inner = centered_rect(70, 5, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(app.status.clone())
+            .style(Style::default().fg(Color::Yellow))
+            .wrap(Wrap { trim: true }),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            opt("r", "retry"),
+            opt("s", "change server"),
+            opt("a", "accounts"),
+            opt("q", "quit"),
+        ])),
+        rows[2],
+    );
+}
+
+fn opt(key: &'static str, label: &'static str) -> Span<'static> {
+    Span::styled(
+        format!("[{key}] {label}   "),
+        Style::default().fg(Color::White),
+    )
+}
+
+// === Help overlay ===========================================================
+
+fn render_help(f: &mut Frame) {
+    let area = f.area();
+    let rect = centered_rect(70, 14, area);
+    f.render_widget(Clear, rect);
+
+    let line = |k: &str, v: &str| {
+        Line::from(vec![
+            Span::styled(format!("{k:<22}"), Style::default().fg(ACCENT)),
+            Span::raw(v.to_string()),
+        ])
+    };
+    let body = vec![
+        line("F1", "toggle this help"),
+        line("Ctrl+Q", "quit from anywhere"),
+        Line::raw(""),
+        line("Accounts", "↑/↓ move · Enter connect · a add · d delete"),
+        line("Login", "Tab field · Ctrl+R login/register · Enter submit"),
+        Line::raw(""),
+        line("Chat: Enter", "send message"),
+        line("Chat: /dm <user>", "open a chat (or click a name)"),
+        line("Chat: Tab", "autocomplete commands / usernames"),
+        line("Chat: ←/→ Home/End", "move the caret · Del/Backspace edit"),
+        line("Chat: /accounts · Esc", "back to session manager"),
+        line("Chat: /quit", "exit the app"),
+    ];
+
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .title(" help · commands & keys ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT)),
+        ),
+        rect,
+    );
+}
+
+// === Shared helpers =========================================================
+
+fn framed(title: &'static str) -> Block<'static> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+}
+
+fn field_line(label: &str, value: &str, focused: bool) -> Paragraph<'static> {
+    let (marker, style) = if focused {
+        ("> ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+    } else {
+        ("  ", Style::default().fg(Color::Gray))
+    };
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!("{marker}{label}: "), style),
+        Span::raw(value.to_string()),
+    ]))
+}
+
+/// Place the terminal cursor inside a `field_line` at character `cursor`.
+fn set_field_cursor(f: &mut Frame, row: Rect, label: &str, cursor: usize) {
+    let prefix = (2 + label.len() + 2) as u16; // "> " + label + ": "
+    f.set_cursor_position(Position::new(row.x + prefix + cursor as u16, row.y));
 }
 
 fn format_msg(app: &App, m: &DirectMessage) -> Line<'static> {
