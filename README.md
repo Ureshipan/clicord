@@ -57,6 +57,12 @@ In the client:
   there together). Type and `Enter` to send. `Tab` autocompletes commands,
   usernames and group names. Edit with `←/→`, `Home/End`, `Delete`. Unread chats
   show a red badge. `Esc` or `/accounts` returns to the session manager.
+- **Scrollback:** `PgUp/PgDn`, `↑/↓` or the mouse wheel scroll the history. At
+  the bottom it sticks to the newest message; scroll up and incoming messages
+  no longer shift the view — a `▼ N new` marker appears instead, and the chat's
+  unread badge counts up until you return to the bottom.
+- **Typing indicators:** while someone types in the open conversation, the input
+  box title shows `… is typing…` (it clears after a few seconds of silence).
 - **Connection lost / unreachable:** a screen offers `r` retry, `s` change
   server, `a` accounts, `q` quit.
 - **`F1`** shows all commands and keybindings; **`Ctrl+Q`** quits from anywhere.
@@ -109,7 +115,8 @@ runs as a container. To build the client locally for a target, use
 
 1. ✅ Auth + 1:1 DMs + presence
 2. ✅ Group chats + user search
-3. Message history pagination; typing indicators / read receipts
-4. Bot tokens (bots are just clients with a bot credential)
-5. Voice calls: server-side signaling (SDP/ICE over `/ws`) + P2P media via
+3. ✅ Scrollback (stick-to-bottom) + typing indicators
+4. Read receipts; message history pagination
+5. Bot tokens (bots are just clients with a bot credential)
+6. Voice calls: server-side signaling (SDP/ICE over `/ws`) + P2P media via
    WebRTC, with a TURN relay fallback

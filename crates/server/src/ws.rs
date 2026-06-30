@@ -240,6 +240,29 @@ async fn handle_client_msg(
             };
             let _ = self_tx.send(ServerMsg::SearchResults { query, users });
         }
+        ClientMsg::Typing { to_user, group_id } => {
+            match (group_id, to_user) {
+                (Some(gid), _) => {
+                    if let Ok(members) = db::group_members(&st.db, gid).await {
+                        for m in members {
+                            if m != username {
+                                st.hub.send_to_user(
+                                    &m,
+                                    ServerMsg::Typing { from: username.to_string(), group_id: Some(gid) },
+                                );
+                            }
+                        }
+                    }
+                }
+                (None, Some(to)) if to != username => {
+                    st.hub.send_to_user(
+                        &to,
+                        ServerMsg::Typing { from: username.to_string(), group_id: None },
+                    );
+                }
+                _ => {}
+            }
+        }
     }
     true
 }

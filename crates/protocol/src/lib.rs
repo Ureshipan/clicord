@@ -68,6 +68,9 @@ pub enum ClientMsg {
     SendGroup { group_id: GroupId, body: String },
     /// Search registered users whose name starts with `query`.
     SearchUsers { query: String },
+    /// Signal that the sender is typing in a DM (`to_user`) or a group
+    /// (`group_id`). Exactly one of the two is expected to be set.
+    Typing { to_user: Option<String>, group_id: Option<GroupId> },
     /// Keepalive.
     Ping,
 }
@@ -92,6 +95,9 @@ pub enum ServerMsg {
     GroupHistory { group_id: GroupId, messages: Vec<GroupMessage> },
     /// Results of a user search.
     SearchResults { query: String, users: Vec<String> },
+    /// `from` is typing. `group_id` set => in that group; otherwise a DM from
+    /// `from` to this client.
+    Typing { from: String, group_id: Option<GroupId> },
     /// Presence change of some user.
     Presence { username: String, online: bool },
     /// A recoverable, human-readable error.

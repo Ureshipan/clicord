@@ -50,6 +50,8 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, default_server: String) -> 
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Incoming>();
     let mut app = App::new(default_server, config, store, in_tx);
     let mut events = EventStream::new();
+    // Periodic tick so time-based UI (typing indicators) updates without input.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
 
     while !app.should_quit {
         terminal.draw(|f| ui::render(f, &app))?;
@@ -62,6 +64,7 @@ async fn run<B: Backend>(terminal: &mut Terminal<B>, default_server: String) -> 
                 Some(Err(_)) | None => break,
             },
             Some(incoming) = in_rx.recv() => app.on_incoming(incoming),
+            _ = tick.tick() => app.tick(),
         }
     }
     Ok(())

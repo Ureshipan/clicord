@@ -231,8 +231,11 @@ fn render_chat(f: &mut Frame, app: &App) {
     };
     let title = format!(" {} ", app.active_name());
     let visible = l.messages.height.saturating_sub(2) as usize;
-    let skip = lines.len().saturating_sub(visible);
-    let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
+    let total = lines.len();
+    // `scroll` counts messages hidden below the viewport (0 = newest visible).
+    let bottom = total.saturating_sub(app.scroll);
+    let start = bottom.saturating_sub(visible);
+    let shown: Vec<Line> = lines[start..bottom].to_vec();
     f.render_widget(
         Paragraph::new(shown)
             .block(Block::default().title(title).borders(Borders::ALL))
@@ -240,11 +243,44 @@ fn render_chat(f: &mut Frame, app: &App) {
         l.messages,
     );
 
-    // Input box — focused, accent border + live cursor.
+    // When scrolled up, show a marker (and unread count) at the bottom edge.
+    if app.scroll > 0 && l.messages.height > 2 {
+        let n = app
+            .active
+            .as_ref()
+            .and_then(|t| app.unread.get(t))
+            .copied()
+            .unwrap_or(0);
+        let text = if n > 0 {
+            format!(" ▼ {n} new — PgDn / wheel for latest ")
+        } else {
+            " ▼ PgDn / wheel for latest ".to_string()
+        };
+        let row = Rect::new(
+            l.messages.x + 1,
+            l.messages.y + l.messages.height - 2,
+            l.messages.width.saturating_sub(2),
+            1,
+        );
+        f.render_widget(Clear, row);
+        f.render_widget(
+            Paragraph::new(text).style(
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            row,
+        );
+    }
+
+    // Input box — focused, accent border + live cursor. Title doubles as the
+    // typing indicator for the active conversation.
+    let input_title = match app.typing_text() {
+        Some(t) => format!(" {t} "),
+        None => " message ".to_string(),
+    };
     f.render_widget(
         Paragraph::new(app.input.value()).block(
             Block::default()
-                .title(" message ")
+                .title(input_title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT)),
         ),
@@ -362,6 +398,7 @@ fn render_help(f: &mut Frame) {
         line("/g <name>", "open one of your groups"),
         line("Tab", "autocomplete commands / names"),
         line("←/→ Home/End", "move caret · Del/Backspace edit"),
+        line("PgUp/PgDn ↑/↓ wheel", "scroll history (sticks to newest)"),
         line("/accounts · Esc", "back to session manager"),
         line("/quit", "exit the app"),
     ];

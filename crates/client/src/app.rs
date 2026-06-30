@@ -5,7 +5,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use protocol::{ClientMsg, DirectMessage, GroupId, GroupInfo, GroupMessage, ServerMsg};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// How long a "typing" signal stays visible without a refresh.
+const TYPING_TTL: Duration = Duration::from_secs(4);
+/// Minimum gap between typing signals we emit while the user keeps typing.
+const TYPING_THROTTLE: Duration = Duration::from_millis(1500);
 
 use crate::input::TextInput;
 use crate::net::{self, Incoming};
@@ -80,6 +86,12 @@ pub struct App {
     pub online: BTreeSet<String>,
     pub directory: BTreeSet<String>,
     pub unread: BTreeMap<Target, u32>,
+    /// Messages hidden below the viewport of the active chat. 0 = stuck to the
+    /// newest message (autoscroll); > 0 = the user scrolled up.
+    pub scroll: usize,
+    /// Per-target set of users currently typing, with the last time we heard so.
+    pub typing: BTreeMap<Target, BTreeMap<String, Instant>>,
+    last_typing_sent: Option<Instant>,
     pending_group: Option<String>,
 
     // autocomplete
@@ -139,6 +151,9 @@ impl App {
             online: BTreeSet::new(),
             directory: BTreeSet::new(),
             unread: BTreeMap::new(),
+            scroll: 0,
+            typing: BTreeMap::new(),
+            last_typing_sent: None,
             pending_group: None,
             suggestions: Vec::new(),
             selected: None,
@@ -350,6 +365,16 @@ impl App {
         match key.code {
             KeyCode::Esc => self.go_to_accounts(),
             KeyCode::Tab => self.apply_suggestion(),
+            KeyCode::Up => self.scroll_up(1),
+            KeyCode::Down => self.scroll_down(1),
+            KeyCode::PageUp => {
+                let p = self.msg_viewport().saturating_sub(1).max(1);
+                self.scroll_up(p);
+            }
+            KeyCode::PageDown => {
+                let p = self.msg_viewport().saturating_sub(1).max(1);
+                self.scroll_down(p);
+            }
             KeyCode::Enter => {
                 self.submit_chat();
                 self.recompute_suggestions();
@@ -357,8 +382,62 @@ impl App {
             _ => {
                 if edit_key(&mut self.input, key, ctrl) {
                     self.recompute_suggestions();
+                    self.maybe_send_typing();
                 }
             }
+        }
+    }
+
+    // --- Message scrolling --------------------------------------------------
+
+    fn msg_viewport(&self) -> usize {
+        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let m = layout::chat_layout(Rect::new(0, 0, w, h)).messages;
+        m.height.saturating_sub(2) as usize
+    }
+
+    fn active_msg_count(&self) -> usize {
+        match &self.active {
+            Some(Target::Dm(p)) => self.dm_messages(p).len(),
+            Some(Target::Group(id)) => self.group_messages(*id).len(),
+            None => 0,
+        }
+    }
+
+    fn scroll_up(&mut self, step: usize) {
+        let max = self.active_msg_count().saturating_sub(self.msg_viewport().max(1));
+        self.scroll = (self.scroll + step).min(max);
+    }
+
+    fn scroll_down(&mut self, step: usize) {
+        self.scroll = self.scroll.saturating_sub(step);
+        if self.scroll == 0 {
+            if let Some(t) = self.active.clone() {
+                self.unread.remove(&t);
+            }
+        }
+    }
+
+    fn maybe_send_typing(&mut self) {
+        let value = self.input.value();
+        if value.is_empty() || value.starts_with('/') {
+            return;
+        }
+        let Some(active) = self.active.clone() else { return };
+        let now = Instant::now();
+        if self
+            .last_typing_sent
+            .is_some_and(|t| now.duration_since(t) < TYPING_THROTTLE)
+        {
+            return;
+        }
+        self.last_typing_sent = Some(now);
+        if let Some(tx) = &self.out_tx {
+            let msg = match active {
+                Target::Dm(p) => ClientMsg::Typing { to_user: Some(p), group_id: None },
+                Target::Group(id) => ClientMsg::Typing { to_user: None, group_id: Some(id) },
+            };
+            let _ = tx.send(msg);
         }
     }
 
@@ -377,12 +456,15 @@ impl App {
             return;
         };
         if let Some(tx) = &self.out_tx {
-            let msg = match target {
-                Target::Dm(peer) => ClientMsg::SendDm { to: peer, body: line },
-                Target::Group(id) => ClientMsg::SendGroup { group_id: id, body: line },
+            let msg = match &target {
+                Target::Dm(peer) => ClientMsg::SendDm { to: peer.clone(), body: line },
+                Target::Group(id) => ClientMsg::SendGroup { group_id: *id, body: line },
             };
             let _ = tx.send(msg);
         }
+        // Sending jumps back to the newest message.
+        self.scroll = 0;
+        self.unread.remove(&target);
     }
 
     fn handle_command(&mut self, cmd: &str) {
@@ -431,6 +513,7 @@ impl App {
         let t = Target::Dm(user.clone());
         self.unread.remove(&t);
         self.active = Some(t);
+        self.scroll = 0;
         self.status = format!("now chatting with {user}");
     }
 
@@ -439,6 +522,7 @@ impl App {
         self.unread.remove(&t);
         let name = self.groups.get(&id).map(|g| g.name.clone()).unwrap_or_default();
         self.active = Some(t);
+        self.scroll = 0;
         self.status = format!("now in group #{name}");
     }
 
@@ -548,7 +632,18 @@ impl App {
     // === Mouse handling =====================================================
 
     pub fn on_mouse(&mut self, ev: MouseEvent) {
-        if ev.kind != MouseEventKind::Down(MouseButton::Left) || self.show_help {
+        if self.show_help {
+            return;
+        }
+        // Mouse wheel scrolls the message history.
+        if matches!(self.screen, Screen::Chat) {
+            match ev.kind {
+                MouseEventKind::ScrollUp => return self.scroll_up(3),
+                MouseEventKind::ScrollDown => return self.scroll_down(3),
+                _ => {}
+            }
+        }
+        if ev.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -614,14 +709,15 @@ impl App {
             }
             ServerMsg::Dm(m) => {
                 self.note_peer(&m);
-                let peer = self.other_party(&m);
-                let t = Target::Dm(peer.clone());
+                let from_self = m.from == self.username;
+                let t = Target::Dm(self.other_party(&m));
+                self.messages.push(m);
                 if self.active.is_none() {
                     self.active = Some(t);
-                } else if m.from != self.username && self.active.as_ref() != Some(&t) {
-                    *self.unread.entry(t).or_insert(0) += 1;
+                    self.scroll = 0;
+                } else {
+                    self.bump_for_incoming(t, from_self);
                 }
-                self.messages.push(m);
             }
             ServerMsg::Groups { groups } => {
                 for g in groups {
@@ -640,14 +736,20 @@ impl App {
                 }
             }
             ServerMsg::GroupMsg(gm) => {
+                let from_self = gm.from == self.username;
                 let t = Target::Group(gm.group_id);
-                if gm.from != self.username && self.active.as_ref() != Some(&t) {
-                    *self.unread.entry(t).or_insert(0) += 1;
-                }
                 self.group_messages.push(gm);
+                self.bump_for_incoming(t, from_self);
             }
             ServerMsg::GroupHistory { messages, .. } => {
                 self.group_messages.extend(messages);
+            }
+            ServerMsg::Typing { from, group_id } => {
+                let t = match group_id {
+                    Some(id) => Target::Group(id),
+                    None => Target::Dm(from.clone()),
+                };
+                self.typing.entry(t).or_default().insert(from, Instant::now());
             }
             ServerMsg::SearchResults { query, users } => {
                 for u in &users {
@@ -693,6 +795,53 @@ impl App {
         if !peer.is_empty() {
             self.peers.insert(peer);
         }
+    }
+
+    /// React to a freshly-appended message for conversation `t`.
+    fn bump_for_incoming(&mut self, t: Target, from_self: bool) {
+        if self.active.as_ref() == Some(&t) {
+            // Active chat: if the user scrolled up, keep the view anchored on
+            // the same messages and surface an unread count instead of moving.
+            if self.scroll > 0 {
+                self.scroll += 1;
+                if !from_self {
+                    *self.unread.entry(t).or_insert(0) += 1;
+                }
+            }
+        } else if !from_self {
+            *self.unread.entry(t).or_insert(0) += 1;
+        }
+    }
+
+    /// Periodic housekeeping: drop stale "typing" signals.
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        for users in self.typing.values_mut() {
+            users.retain(|_, t| now.duration_since(*t) < TYPING_TTL);
+        }
+        self.typing.retain(|_, users| !users.is_empty());
+    }
+
+    /// "alice is typing…" for the active conversation, if anyone is.
+    pub fn typing_text(&self) -> Option<String> {
+        let t = self.active.as_ref()?;
+        let now = Instant::now();
+        let names: Vec<&str> = self
+            .typing
+            .get(t)?
+            .iter()
+            .filter(|(u, seen)| **u != self.username && now.duration_since(**seen) < TYPING_TTL)
+            .map(|(u, _)| u.as_str())
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        let joined = names.join(", ");
+        Some(if names.len() == 1 {
+            format!("{joined} is typing…")
+        } else {
+            format!("{joined} are typing…")
+        })
     }
 
     // === Views used by the renderer ========================================
@@ -756,6 +905,9 @@ impl App {
         self.online.clear();
         self.directory.clear();
         self.unread.clear();
+        self.scroll = 0;
+        self.typing.clear();
+        self.last_typing_sent = None;
         self.pending_group = None;
         self.input.clear();
         self.suggestions.clear();
@@ -884,6 +1036,48 @@ mod tests {
         }));
         assert_eq!(a.active, Some(Target::Group(7)));
         assert!(a.groups.contains_key(&7));
+    }
+
+    #[test]
+    fn scrolled_up_active_chat_anchors_and_counts() {
+        let mut a = test_app();
+        a.username = "me".into();
+        a.active = Some(Target::Dm("bob".into()));
+        a.scroll = 3;
+        a.on_server_msg(ServerMsg::Dm(DirectMessage {
+            from: "bob".into(),
+            to: "me".into(),
+            body: "x".into(),
+            ts: 0,
+        }));
+        // View anchored (scroll grew with the message) and unread counted.
+        assert_eq!(a.scroll, 4);
+        assert_eq!(a.unread.get(&Target::Dm("bob".into())), Some(&1));
+    }
+
+    #[test]
+    fn at_bottom_active_chat_stays_read() {
+        let mut a = test_app();
+        a.username = "me".into();
+        a.active = Some(Target::Dm("bob".into()));
+        a.scroll = 0;
+        a.on_server_msg(ServerMsg::Dm(DirectMessage {
+            from: "bob".into(),
+            to: "me".into(),
+            body: "x".into(),
+            ts: 0,
+        }));
+        assert_eq!(a.scroll, 0);
+        assert_eq!(a.unread.get(&Target::Dm("bob".into())), None);
+    }
+
+    #[test]
+    fn typing_text_reports_active_typists() {
+        let mut a = test_app();
+        a.username = "me".into();
+        a.active = Some(Target::Dm("bob".into()));
+        a.on_server_msg(ServerMsg::Typing { from: "bob".into(), group_id: None });
+        assert_eq!(a.typing_text().as_deref(), Some("bob is typing…"));
     }
 
     #[test]
