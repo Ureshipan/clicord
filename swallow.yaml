@@ -8,7 +8,10 @@ ports:
 env:
   CLICORD_LISTEN: "0.0.0.0:8080"
   CLICORD_DB: "sqlite:///data/clicord.db"
-  CLICORD_JWT_SECRET: "change-me-set-a-real-secret-in-the-ui"   # override in the UI
+  # No CLICORD_JWT_SECRET here on purpose — the secret must NOT live in the repo.
+  # The server generates a random one on first boot and persists it in /data.
+  # To override (e.g. once samoswallow's encrypted Secrets are available),
+  # set CLICORD_JWT_SECRET as a Secret — it takes precedence over the persisted one.
 
 resources:
   cpu: "0.5"

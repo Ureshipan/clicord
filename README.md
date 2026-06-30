@@ -54,9 +54,15 @@ Open two clients, register two users, `/dm` each other and chat.
 |----------------------|-------------------------------|----------------------------------|
 | `CLICORD_LISTEN`     | `0.0.0.0:8080`                | bind address                     |
 | `CLICORD_DB`         | `sqlite://clicord.db`         | SQLite connection string         |
-| `CLICORD_JWT_SECRET` | *(insecure dev default)*      | secret for signing session tokens |
+| `CLICORD_JWT_SECRET` | *(auto-generated)*            | secret for signing session tokens |
 
-These map directly onto the `env:` block in `swallow.yaml`.
+`CLICORD_LISTEN`/`CLICORD_DB` map onto the `env:` block in `swallow.yaml`.
+
+**The JWT secret is never committed.** If `CLICORD_JWT_SECRET` is unset, the
+server generates a random secret on first boot and persists it in the database
+(i.e. under `/data` on a mounted volume), so it survives restarts but lives
+only on the private volume. Set `CLICORD_JWT_SECRET` explicitly (e.g. as a
+samoswallow encrypted Secret, once available) to override it.
 
 ## Deploy on samoswallow
 

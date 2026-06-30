@@ -35,12 +35,23 @@ async fn main() -> anyhow::Result<()> {
     // Configuration via env vars — these map cleanly onto samoswallow's `env:` block.
     let listen = env_or("CLICORD_LISTEN", "0.0.0.0:8080");
     let db_url = env_or("CLICORD_DB", "sqlite://clicord.db");
-    let jwt_secret = env_or("CLICORD_JWT_SECRET", "dev-insecure-secret-change-me");
-    if jwt_secret == "dev-insecure-secret-change-me" {
-        tracing::warn!("CLICORD_JWT_SECRET is unset — using an insecure development secret");
-    }
 
     let db = db::connect(&db_url).await?;
+
+    // The JWT secret never lives in the repo or config. An explicit
+    // CLICORD_JWT_SECRET (e.g. a samoswallow encrypted Secret) wins; otherwise
+    // we use a random secret persisted in the database under /data.
+    let jwt_secret = match std::env::var("CLICORD_JWT_SECRET") {
+        Ok(s) if !s.is_empty() => {
+            tracing::info!("using JWT secret from CLICORD_JWT_SECRET");
+            s
+        }
+        _ => {
+            tracing::info!("CLICORD_JWT_SECRET unset — using persisted secret from the database");
+            db::get_or_create_jwt_secret(&db).await?
+        }
+    };
+
     let state = AppState {
         db,
         jwt_secret: Arc::new(jwt_secret),

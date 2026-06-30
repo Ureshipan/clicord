@@ -43,7 +43,48 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages (sender, recipient)")
         .execute(pool)
         .await?;
+
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+/// Return the persisted JWT signing secret, generating and storing a random
+/// one on first run. Persisted in the database (i.e. under /data in
+/// production), so it survives restarts but never lives in the repo or config.
+pub async fn get_or_create_jwt_secret(pool: &SqlitePool) -> Result<String> {
+    let existing: Option<(String,)> = sqlx::query_as("SELECT value FROM meta WHERE key = 'jwt_secret'")
+        .fetch_optional(pool)
+        .await?;
+    if let Some((secret,)) = existing {
+        return Ok(secret);
+    }
+
+    let secret = random_hex_32();
+    // INSERT OR IGNORE guards against a race between two concurrent boots.
+    sqlx::query("INSERT OR IGNORE INTO meta (key, value) VALUES ('jwt_secret', ?)")
+        .bind(&secret)
+        .execute(pool)
+        .await?;
+
+    // Re-read so every instance ends up with the same persisted value.
+    let (secret,): (String,) = sqlx::query_as("SELECT value FROM meta WHERE key = 'jwt_secret'")
+        .fetch_one(pool)
+        .await?;
+    Ok(secret)
+}
+
+fn random_hex_32() -> String {
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub async fn user_exists(pool: &SqlitePool, username: &str) -> Result<bool> {
