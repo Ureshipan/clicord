@@ -33,6 +33,26 @@ pub struct DirectMessage {
     pub ts: i64,
 }
 
+pub type GroupId = i64;
+
+/// Metadata about a group chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupInfo {
+    pub id: GroupId,
+    pub name: String,
+    pub members: Vec<String>,
+}
+
+/// A single message sent to a group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMessage {
+    pub group_id: GroupId,
+    pub from: String,
+    pub body: String,
+    /// Unix timestamp in milliseconds.
+    pub ts: i64,
+}
+
 /// Messages the client sends to the server over the websocket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -41,6 +61,13 @@ pub enum ClientMsg {
     Auth { token: String },
     /// Send a direct message to `to`.
     SendDm { to: String, body: String },
+    /// Create a group with the given name and initial members (besides the
+    /// creator, who is always added).
+    CreateGroup { name: String, members: Vec<String> },
+    /// Send a message to a group the sender belongs to.
+    SendGroup { group_id: GroupId, body: String },
+    /// Search registered users whose name starts with `query`.
+    SearchUsers { query: String },
     /// Keepalive.
     Ping,
 }
@@ -53,8 +80,18 @@ pub enum ServerMsg {
     AuthOk { username: String },
     /// A direct message involving this client (sent or received).
     Dm(DirectMessage),
-    /// Recent history replayed right after auth.
+    /// Recent DM history replayed right after auth.
     History { messages: Vec<DirectMessage> },
+    /// The groups this user belongs to (sent on connect, and on changes).
+    Groups { groups: Vec<GroupInfo> },
+    /// A group this user was just added to / created.
+    GroupCreated(GroupInfo),
+    /// A message in one of this user's groups.
+    GroupMsg(GroupMessage),
+    /// Recent history for a single group.
+    GroupHistory { group_id: GroupId, messages: Vec<GroupMessage> },
+    /// Results of a user search.
+    SearchResults { query: String, users: Vec<String> },
     /// Presence change of some user.
     Presence { username: String, online: bool },
     /// A recoverable, human-readable error.

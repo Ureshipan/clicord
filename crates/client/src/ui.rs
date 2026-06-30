@@ -1,13 +1,12 @@
 //! All rendering. Widgets read from `App` and never mutate it.
 
-use protocol::DirectMessage;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, LoginField, LoginMode, Screen};
+use crate::app::{App, LoginField, LoginMode, Screen, Target};
 use crate::layout;
 
 const ACCENT: Color = Color::Cyan;
@@ -169,11 +168,6 @@ fn render_login(f: &mut Frame, app: &App) {
 fn render_chat(f: &mut Frame, app: &App) {
     let l = layout::chat_layout(f.area());
 
-    let peer = if app.active_peer.is_empty() {
-        "(no chat)".to_string()
-    } else {
-        app.active_peer.clone()
-    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -181,27 +175,33 @@ fn render_chat(f: &mut Frame, app: &App) {
                 Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(" {} ", app.username)),
-            Span::styled(format!("» {peer}"), Style::default().fg(Color::Green)),
+            Span::styled(format!("» {}", app.active_name()), Style::default().fg(Color::Green)),
         ])),
         l.header,
     );
 
-    // Peers list with unread counters.
+    // Conversation list: groups and DMs, with unread badges.
     let items: Vec<ListItem> = app
-        .peers
+        .chat_entries()
         .iter()
-        .map(|p| {
-            let online = app.online.contains(p);
-            let style = if *p == app.active_peer {
+        .map(|t| {
+            let active = app.active.as_ref() == Some(t);
+            let (marker, online) = match t {
+                Target::Dm(u) => {
+                    let on = app.online.contains(u);
+                    (if on { "●" } else { "○" }.to_string(), on)
+                }
+                Target::Group(_) => ("▣".to_string(), false),
+            };
+            let style = if active {
                 Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
             } else if online {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let dot = if online { "●" } else { "○" };
-            let mut spans = vec![Span::styled(format!("{dot} {p}"), style)];
-            if let Some(n) = app.unread.get(p).filter(|n| **n > 0) {
+            let mut spans = vec![Span::styled(format!("{marker} {}", app.target_name(t)), style)];
+            if let Some(n) = app.unread.get(t).filter(|n| **n > 0) {
                 spans.push(Span::styled(
                     format!(" ({n})"),
                     Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD),
@@ -215,20 +215,24 @@ fn render_chat(f: &mut Frame, app: &App) {
         l.peers,
     );
 
-    // Messages
-    let title = if app.active_peer.is_empty() {
-        " messages ".to_string()
-    } else {
-        format!(" {} ", app.active_peer)
+    // Messages for the active conversation.
+    let lines: Vec<Line> = match &app.active {
+        None => Vec::new(),
+        Some(Target::Dm(peer)) => app
+            .dm_messages(peer)
+            .into_iter()
+            .map(|m| format_line(app, &m.from, &m.body, m.ts))
+            .collect(),
+        Some(Target::Group(id)) => app
+            .group_messages(*id)
+            .into_iter()
+            .map(|m| format_line(app, &m.from, &m.body, m.ts))
+            .collect(),
     };
-    let all: Vec<Line> = app
-        .messages_for_active()
-        .into_iter()
-        .map(|m| format_msg(app, m))
-        .collect();
+    let title = format!(" {} ", app.active_name());
     let visible = l.messages.height.saturating_sub(2) as usize;
-    let skip = all.len().saturating_sub(visible);
-    let shown: Vec<Line> = all.into_iter().skip(skip).collect();
+    let skip = lines.len().saturating_sub(visible);
+    let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
     f.render_widget(
         Paragraph::new(shown)
             .block(Block::default().title(title).borders(Borders::ALL))
@@ -352,12 +356,14 @@ fn render_help(f: &mut Frame) {
         line("Accounts", "↑/↓ move · Enter connect · a add · d delete"),
         line("Login", "Tab field · Ctrl+R login/register · Enter submit"),
         Line::raw(""),
-        line("Chat: Enter", "send message"),
-        line("Chat: /dm <user>", "open a chat (or click a name)"),
-        line("Chat: Tab", "autocomplete commands / usernames"),
-        line("Chat: ←/→ Home/End", "move the caret · Del/Backspace edit"),
-        line("Chat: /accounts · Esc", "back to session manager"),
-        line("Chat: /quit", "exit the app"),
+        line("/dm <user>", "open a direct chat (or click a name)"),
+        line("/find <prefix>", "search registered users"),
+        line("/group <name> [users]", "create a group"),
+        line("/g <name>", "open one of your groups"),
+        line("Tab", "autocomplete commands / names"),
+        line("←/→ Home/End", "move caret · Del/Backspace edit"),
+        line("/accounts · Esc", "back to session manager"),
+        line("/quit", "exit the app"),
     ];
 
     f.render_widget(
@@ -398,17 +404,16 @@ fn set_field_cursor(f: &mut Frame, row: Rect, label: &str, cursor: usize) {
     f.set_cursor_position(Position::new(row.x + prefix + cursor as u16, row.y));
 }
 
-fn format_msg(app: &App, m: &DirectMessage) -> Line<'static> {
-    let mine = m.from == app.username;
-    let who_style = if mine {
+fn format_line(app: &App, from: &str, body: &str, ts: i64) -> Line<'static> {
+    let who_style = if from == app.username {
         Style::default().fg(ACCENT)
     } else {
         Style::default().fg(Color::Magenta)
     };
     Line::from(vec![
-        Span::styled(format!("[{}] ", format_ts(m.ts)), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}: ", m.from), who_style.add_modifier(Modifier::BOLD)),
-        Span::raw(m.body.clone()),
+        Span::styled(format!("[{}] ", format_ts(ts)), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{from}: "), who_style.add_modifier(Modifier::BOLD)),
+        Span::raw(body.to_string()),
     ])
 }
 

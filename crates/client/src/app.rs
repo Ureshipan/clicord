@@ -2,7 +2,7 @@
 //! (`ui.rs`), networking (`net.rs`) and persistence (`session.rs`).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use protocol::{ClientMsg, DirectMessage, ServerMsg};
+use protocol::{ClientMsg, DirectMessage, GroupId, GroupInfo, GroupMessage, ServerMsg};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc::UnboundedSender;
@@ -20,11 +20,11 @@ pub enum Screen {
     ConnError,
 }
 
-/// Where the server-setup screen returns to once an address is entered.
-#[derive(Clone, Copy)]
-enum SetupReturn {
-    Start,
-    Reconnect,
+/// A conversation the user can have open: a direct chat or a group.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Target {
+    Dm(String),
+    Group(GroupId),
 }
 
 #[derive(Clone, Copy)]
@@ -46,7 +46,7 @@ struct PendingConn {
     token: String,
 }
 
-const COMMANDS: &[&str] = &["dm", "accounts", "help", "quit"];
+const COMMANDS: &[&str] = &["dm", "group", "g", "find", "accounts", "help", "quit"];
 
 pub struct App {
     pub config: Config,
@@ -58,13 +58,10 @@ pub struct App {
 
     setup_return: SetupReturn,
 
-    // account manager
     pub accounts_idx: usize,
 
-    // server setup
     pub server_input: TextInput,
 
-    // login
     pub login_mode: LoginMode,
     pub login_field: LoginField,
     pub username_input: TextInput,
@@ -74,23 +71,32 @@ pub struct App {
     pub username: String,
     pub server: String,
     pub authed: bool,
-    pub active_peer: String,
+    pub active: Option<Target>,
     pub input: TextInput,
     pub messages: Vec<DirectMessage>,
+    pub group_messages: Vec<GroupMessage>,
+    pub groups: BTreeMap<GroupId, GroupInfo>,
     pub peers: BTreeSet<String>,
     pub online: BTreeSet<String>,
-    pub unread: BTreeMap<String, u32>,
+    pub directory: BTreeSet<String>,
+    pub unread: BTreeMap<Target, u32>,
+    pending_group: Option<String>,
 
     // autocomplete
     pub suggestions: Vec<String>,
     pub selected: Option<usize>,
 
-    // connection retry context
     pending: Option<PendingConn>,
     auth_failed: bool,
 
     in_tx: UnboundedSender<Incoming>,
     out_tx: Option<UnboundedSender<ClientMsg>>,
+}
+
+#[derive(Clone, Copy)]
+enum SetupReturn {
+    Start,
+    Reconnect,
 }
 
 impl App {
@@ -102,17 +108,9 @@ impl App {
                 TextInput::with(default_server),
             )
         } else if store.accounts.is_empty() {
-            (
-                Screen::Login,
-                "no saved accounts — register or log in".to_string(),
-                TextInput::default(),
-            )
+            (Screen::Login, "no saved accounts — register or log in".to_string(), TextInput::default())
         } else {
-            (
-                Screen::Accounts,
-                "select an account · Enter connect · a add · d delete".to_string(),
-                TextInput::default(),
-            )
+            (Screen::Accounts, "select an account · Enter connect · a add · d delete".to_string(), TextInput::default())
         };
 
         Self {
@@ -132,12 +130,16 @@ impl App {
             username: String::new(),
             server: String::new(),
             authed: false,
-            active_peer: String::new(),
+            active: None,
             input: TextInput::default(),
             messages: Vec::new(),
+            group_messages: Vec::new(),
+            groups: BTreeMap::new(),
             peers: BTreeSet::new(),
             online: BTreeSet::new(),
+            directory: BTreeSet::new(),
             unread: BTreeMap::new(),
+            pending_group: None,
             suggestions: Vec::new(),
             selected: None,
             pending: None,
@@ -152,13 +154,11 @@ impl App {
     pub async fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // Global: quit and help work from any screen.
         if ctrl && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
             self.should_quit = true;
             return;
         }
         if self.show_help {
-            // While the help overlay is up, most keys just dismiss it.
             if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter) {
                 self.show_help = false;
             }
@@ -213,18 +213,15 @@ impl App {
                 }
             }
             SetupReturn::Reconnect => {
-                // Re-point the pending account at the new address and retry.
                 if let Some(p) = self.pending.as_mut() {
                     p.server = server.clone();
                 }
-                if let Some(acct) = self
-                    .store
-                    .accounts
-                    .iter_mut()
-                    .find(|a| Some(&a.username) == self.pending.as_ref().map(|p| &p.username))
-                {
-                    acct.server = server;
-                    session::save(&self.store);
+                let target_user = self.pending.as_ref().map(|p| p.username.clone());
+                if let Some(user) = target_user {
+                    if let Some(acct) = self.store.accounts.iter_mut().find(|a| a.username == user) {
+                        acct.server = server;
+                        session::save(&self.store);
+                    }
                 }
                 self.retry();
             }
@@ -375,15 +372,16 @@ impl App {
             self.handle_command(rest);
             return;
         }
-        if self.active_peer.is_empty() {
-            self.status = "no active chat — use /dm <user> or click a name".into();
+        let Some(target) = self.active.clone() else {
+            self.status = "no active chat — /dm <user>, /g <group>, or click a name".into();
             return;
-        }
+        };
         if let Some(tx) = &self.out_tx {
-            let _ = tx.send(ClientMsg::SendDm {
-                to: self.active_peer.clone(),
-                body: line,
-            });
+            let msg = match target {
+                Target::Dm(peer) => ClientMsg::SendDm { to: peer, body: line },
+                Target::Group(id) => ClientMsg::SendGroup { group_id: id, body: line },
+            };
+            let _ = tx.send(msg);
         }
     }
 
@@ -391,9 +389,36 @@ impl App {
         let mut parts = cmd.split_whitespace();
         match parts.next() {
             Some("dm") | Some("to") => match parts.next() {
-                Some(user) => self.open_chat_with(user.to_string()),
+                Some(user) => self.open_dm(user.to_string()),
                 None => self.status = "usage: /dm <user>".into(),
             },
+            Some("group") => {
+                let name = parts.next().map(|s| s.to_string());
+                let members: Vec<String> = parts.map(|s| s.to_string()).collect();
+                match name {
+                    Some(name) => {
+                        self.pending_group = Some(name.clone());
+                        if let Some(tx) = &self.out_tx {
+                            let _ = tx.send(ClientMsg::CreateGroup { name: name.clone(), members });
+                        }
+                        self.status = format!("creating group #{name}…");
+                    }
+                    None => self.status = "usage: /group <name> [members...]".into(),
+                }
+            }
+            Some("g") | Some("open") => match parts.next() {
+                Some(name) => self.open_group_by_name(name),
+                None => self.status = "usage: /g <group-name>".into(),
+            },
+            Some("find") | Some("search") => {
+                let query = parts.collect::<Vec<_>>().join(" ");
+                if query.is_empty() {
+                    self.status = "usage: /find <prefix>".into();
+                } else if let Some(tx) = &self.out_tx {
+                    let _ = tx.send(ClientMsg::SearchUsers { query });
+                    self.status = "searching…".into();
+                }
+            }
             Some("accounts") | Some("sessions") => self.go_to_accounts(),
             Some("quit") | Some("q") => self.should_quit = true,
             Some("help") => self.show_help = true,
@@ -401,11 +426,27 @@ impl App {
         }
     }
 
-    fn open_chat_with(&mut self, user: String) {
+    fn open_dm(&mut self, user: String) {
         self.peers.insert(user.clone());
-        self.unread.remove(&user);
-        self.active_peer = user;
-        self.status = format!("now chatting with {}", self.active_peer);
+        let t = Target::Dm(user.clone());
+        self.unread.remove(&t);
+        self.active = Some(t);
+        self.status = format!("now chatting with {user}");
+    }
+
+    fn open_group(&mut self, id: GroupId) {
+        let t = Target::Group(id);
+        self.unread.remove(&t);
+        let name = self.groups.get(&id).map(|g| g.name.clone()).unwrap_or_default();
+        self.active = Some(t);
+        self.status = format!("now in group #{name}");
+    }
+
+    fn open_group_by_name(&mut self, name: &str) {
+        match self.groups.values().find(|g| g.name == name).map(|g| g.id) {
+            Some(id) => self.open_group(id),
+            None => self.status = format!("no group named #{name}"),
+        }
     }
 
     // --- Connection error screen -------------------------------------------
@@ -444,7 +485,7 @@ impl App {
 
     fn recompute_suggestions(&mut self) {
         self.suggestions.clear();
-        self.selected = None; // nothing highlighted until the user presses Tab
+        self.selected = None;
         let Some(rest) = self.input.value().strip_prefix('/') else {
             return;
         };
@@ -463,12 +504,33 @@ impl App {
                     }
                 }
             }
+            Some((cmd, arg)) if cmd == "g" || cmd == "open" => {
+                for g in self.groups.values() {
+                    if g.name.starts_with(arg) {
+                        self.suggestions.push(format!("/{cmd} {}", g.name));
+                    }
+                }
+            }
+            // For /group, complete the last whitespace-separated token as a user.
+            Some(("group", arg)) => {
+                if let Some((head, last)) = arg.rsplit_once(' ') {
+                    for u in self.known_users() {
+                        if u != self.username && u.starts_with(last) {
+                            self.suggestions.push(format!("/group {head} {u}"));
+                        }
+                    }
+                }
+            }
             Some(_) => {}
         }
     }
 
     fn known_users(&self) -> BTreeSet<String> {
-        self.peers.union(&self.online).cloned().collect()
+        self.peers
+            .union(&self.online)
+            .chain(self.directory.iter())
+            .cloned()
+            .collect()
     }
 
     fn apply_suggestion(&mut self) {
@@ -493,9 +555,12 @@ impl App {
         let area = Rect::new(0, 0, w, h);
         match self.screen {
             Screen::Chat => {
-                let peers = layout::chat_layout(area).peers;
-                if let Some(peer) = peer_at(&self.peers, peers, ev.column, ev.row) {
-                    self.open_chat_with(peer);
+                let panel = layout::chat_layout(area).peers;
+                if let Some(t) = self.entry_at(panel, ev.column, ev.row) {
+                    match t {
+                        Target::Dm(u) => self.open_dm(u),
+                        Target::Group(id) => self.open_group(id),
+                    }
                 }
             }
             Screen::Accounts => {
@@ -512,15 +577,22 @@ impl App {
         }
     }
 
-    // === Incoming events from the network task =============================
+    fn entry_at(&self, rect: Rect, col: u16, row: u16) -> Option<Target> {
+        let inside_x = col >= rect.x && col < rect.x + rect.width;
+        let inside_y = row > rect.y && row < rect.y + rect.height.saturating_sub(1);
+        if !inside_x || !inside_y {
+            return None;
+        }
+        let idx = (row - rect.y - 1) as usize;
+        self.chat_entries().into_iter().nth(idx)
+    }
+
+    // === Incoming events ===================================================
 
     pub fn on_incoming(&mut self, ev: Incoming) {
         match ev {
             Incoming::Server(msg) => self.on_server_msg(msg),
             Incoming::ConnectFailed(m) | Incoming::Disconnected(m) => {
-                // Ignore drops that arrive after we already left the chat (e.g.
-                // an intentional disconnect, or a token rejection already routed
-                // to the login screen).
                 if matches!(self.screen, Screen::Chat) && !self.auth_failed {
                     self.enter_conn_error(m);
                 }
@@ -543,13 +615,49 @@ impl App {
             ServerMsg::Dm(m) => {
                 self.note_peer(&m);
                 let peer = self.other_party(&m);
-                if self.active_peer.is_empty() {
-                    self.active_peer = peer.clone();
-                    self.unread.remove(&peer);
-                } else if m.from != self.username && peer != self.active_peer {
-                    *self.unread.entry(peer).or_insert(0) += 1;
+                let t = Target::Dm(peer.clone());
+                if self.active.is_none() {
+                    self.active = Some(t);
+                } else if m.from != self.username && self.active.as_ref() != Some(&t) {
+                    *self.unread.entry(t).or_insert(0) += 1;
                 }
                 self.messages.push(m);
+            }
+            ServerMsg::Groups { groups } => {
+                for g in groups {
+                    self.groups.insert(g.id, g);
+                }
+            }
+            ServerMsg::GroupCreated(info) => {
+                let id = info.id;
+                let name = info.name.clone();
+                self.groups.insert(id, info);
+                if self.pending_group.as_deref() == Some(name.as_str()) {
+                    self.pending_group = None;
+                    self.open_group(id);
+                } else {
+                    self.status = format!("added to group #{name}");
+                }
+            }
+            ServerMsg::GroupMsg(gm) => {
+                let t = Target::Group(gm.group_id);
+                if gm.from != self.username && self.active.as_ref() != Some(&t) {
+                    *self.unread.entry(t).or_insert(0) += 1;
+                }
+                self.group_messages.push(gm);
+            }
+            ServerMsg::GroupHistory { messages, .. } => {
+                self.group_messages.extend(messages);
+            }
+            ServerMsg::SearchResults { query, users } => {
+                for u in &users {
+                    self.directory.insert(u.clone());
+                }
+                self.status = if users.is_empty() {
+                    format!("no users match '{query}'")
+                } else {
+                    format!("found: {}", users.join(", "))
+                };
             }
             ServerMsg::Presence { username, online } => {
                 if online {
@@ -560,7 +668,6 @@ impl App {
             }
             ServerMsg::Error { message } => {
                 if !self.authed && matches!(self.screen, Screen::Chat) {
-                    // Rejected before we authenticated — bad/expired token.
                     self.auth_failed = true;
                     self.out_tx = None;
                     self.open_login();
@@ -588,17 +695,45 @@ impl App {
         }
     }
 
-    pub fn messages_for_active(&self) -> Vec<&DirectMessage> {
-        if self.active_peer.is_empty() {
-            return Vec::new();
+    // === Views used by the renderer ========================================
+
+    /// All open conversations, groups first then DM peers — the order the
+    /// chat list and mouse hit-testing both rely on.
+    pub fn chat_entries(&self) -> Vec<Target> {
+        let mut v: Vec<Target> = self.groups.keys().map(|id| Target::Group(*id)).collect();
+        v.extend(self.peers.iter().cloned().map(Target::Dm));
+        v
+    }
+
+    pub fn target_name(&self, t: &Target) -> String {
+        match t {
+            Target::Dm(u) => u.clone(),
+            Target::Group(id) => self
+                .groups
+                .get(id)
+                .map(|g| format!("#{}", g.name))
+                .unwrap_or_else(|| format!("#{id}")),
         }
+    }
+
+    pub fn active_name(&self) -> String {
+        match &self.active {
+            None => "(no chat)".into(),
+            Some(t) => self.target_name(t),
+        }
+    }
+
+    pub fn dm_messages(&self, peer: &str) -> Vec<&DirectMessage> {
         self.messages
             .iter()
             .filter(|m| {
-                (m.from == self.username && m.to == self.active_peer)
-                    || (m.from == self.active_peer && m.to == self.username)
+                (m.from == self.username && m.to == peer) || (m.from == peer && m.to == self.username)
             })
             .collect()
+    }
+
+    pub fn group_messages(&self, id: GroupId) -> Vec<&GroupMessage> {
+        self.group_messages.iter().filter(|m| m.group_id == id).collect()
     }
 
     // === Session wiring =====================================================
@@ -613,11 +748,15 @@ impl App {
         self.server = server.clone();
         self.authed = false;
         self.auth_failed = false;
-        self.active_peer.clear();
+        self.active = None;
         self.messages.clear();
+        self.group_messages.clear();
+        self.groups.clear();
         self.peers.clear();
         self.online.clear();
+        self.directory.clear();
         self.unread.clear();
+        self.pending_group = None;
         self.input.clear();
         self.suggestions.clear();
         self.selected = None;
@@ -627,8 +766,8 @@ impl App {
     }
 }
 
-/// Apply a text-editing / cursor key to a field. Returns true if the text
-/// content changed (so callers can refresh autocomplete).
+/// Apply a text-editing / cursor key to a field. Returns true if the content
+/// changed (so callers can refresh autocomplete).
 fn edit_key(field: &mut TextInput, key: KeyEvent, ctrl: bool) -> bool {
     match key.code {
         KeyCode::Char(c) if !ctrl => {
@@ -663,7 +802,6 @@ fn edit_key(field: &mut TextInput, key: KeyEvent, ctrl: bool) -> bool {
     }
 }
 
-/// Trim and ensure the address has a scheme; `None` if empty.
 fn normalize_server(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
@@ -674,17 +812,6 @@ fn normalize_server(raw: &str) -> Option<String> {
     } else {
         Some(format!("http://{s}"))
     }
-}
-
-/// Map a click inside the (bordered) peers panel to a peer name.
-fn peer_at(peers: &BTreeSet<String>, rect: Rect, col: u16, row: u16) -> Option<String> {
-    let inside_x = col >= rect.x && col < rect.x + rect.width;
-    let inside_y = row > rect.y && row < rect.y + rect.height.saturating_sub(1);
-    if !inside_x || !inside_y {
-        return None;
-    }
-    let idx = (row - rect.y - 1) as usize;
-    peers.iter().nth(idx).cloned()
 }
 
 #[cfg(test)]
@@ -700,9 +827,9 @@ mod tests {
     #[test]
     fn completes_command_names() {
         let mut a = test_app();
-        a.input.set("/d");
+        a.input.set("/gr");
         a.recompute_suggestions();
-        assert_eq!(a.suggestions, vec!["/dm"]);
+        assert_eq!(a.suggestions, vec!["/group"]);
     }
 
     #[test]
@@ -723,35 +850,54 @@ mod tests {
         a.peers.insert("alice".into());
         a.input.set("/dm al");
         a.recompute_suggestions();
-        assert_eq!(a.selected, None); // popup shows, but no selection yet
+        assert_eq!(a.selected, None);
         a.apply_suggestion();
         assert_eq!(a.selected, Some(0));
         assert_eq!(a.input.value(), "/dm alice");
     }
 
     #[test]
-    fn unread_counts_for_other_chats_only() {
+    fn unread_counts_for_inactive_targets() {
         let mut a = test_app();
         a.username = "me".into();
-        a.active_peer = "bob".into();
-        // message from alice while talking to bob -> unread for alice
+        a.active = Some(Target::Dm("bob".into()));
         a.on_server_msg(ServerMsg::Dm(DirectMessage {
             from: "alice".into(),
             to: "me".into(),
             body: "hi".into(),
             ts: 0,
         }));
-        assert_eq!(a.unread.get("alice"), Some(&1));
-        // message from bob (active) -> no unread
-        a.on_server_msg(ServerMsg::Dm(DirectMessage {
-            from: "bob".into(),
-            to: "me".into(),
+        assert_eq!(a.unread.get(&Target::Dm("alice".into())), Some(&1));
+        a.open_dm("alice".into());
+        assert_eq!(a.unread.get(&Target::Dm("alice".into())), None);
+    }
+
+    #[test]
+    fn group_created_when_pending_opens_it() {
+        let mut a = test_app();
+        a.username = "me".into();
+        a.pending_group = Some("team".into());
+        a.on_server_msg(ServerMsg::GroupCreated(GroupInfo {
+            id: 7,
+            name: "team".into(),
+            members: vec!["me".into(), "bob".into()],
+        }));
+        assert_eq!(a.active, Some(Target::Group(7)));
+        assert!(a.groups.contains_key(&7));
+    }
+
+    #[test]
+    fn group_unread_when_not_active() {
+        let mut a = test_app();
+        a.username = "me".into();
+        a.groups.insert(3, GroupInfo { id: 3, name: "g".into(), members: vec![] });
+        a.active = Some(Target::Dm("bob".into()));
+        a.on_server_msg(ServerMsg::GroupMsg(GroupMessage {
+            group_id: 3,
+            from: "alice".into(),
             body: "yo".into(),
             ts: 0,
         }));
-        assert_eq!(a.unread.get("bob"), None);
-        // opening alice clears her unread
-        a.open_chat_with("alice".into());
-        assert_eq!(a.unread.get("alice"), None);
+        assert_eq!(a.unread.get(&Target::Group(3)), Some(&1));
     }
 }

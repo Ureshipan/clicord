@@ -51,10 +51,12 @@ In the client:
 - **Login screen:** `user`/`pass` fields — `Tab` switches field, `Ctrl+R`
   toggles login/register, `Enter` submits. Logins are saved to the account
   store (`~/.config/clicord/sessions.json`).
-- **Chat screen:** `/dm <user>` opens a conversation (or **click a name**), then
-  type and `Enter`. `Tab` autocompletes commands and, after `/dm `, usernames.
-  Edit with `←/→`, `Home/End`, `Delete`. Unread chats show a red badge. `Esc` or
-  `/accounts` returns to the session manager.
+- **Chat screen:** `/dm <user>` opens a direct conversation, `/find <prefix>`
+  searches registered users, `/group <name> [users...]` creates a group and
+  `/g <name>` opens one (or **click a name** in the list — DMs and groups live
+  there together). Type and `Enter` to send. `Tab` autocompletes commands,
+  usernames and group names. Edit with `←/→`, `Home/End`, `Delete`. Unread chats
+  show a red badge. `Esc` or `/accounts` returns to the session manager.
 - **Connection lost / unreachable:** a screen offers `r` retry, `s` change
   server, `a` accounts, `q` quit.
 - **`F1`** shows all commands and keybindings; **`Ctrl+Q`** quits from anywhere.
@@ -87,11 +89,27 @@ container and routes `clicord.<base-domain>` to it. Health is polled at
 `/health`. Keep `default_instances: 1` until the routing hub is backed by a
 shared bus (see roadmap).
 
+## Releases (cross-platform client binaries)
+
+Push a version tag and GitHub Actions builds the client for Linux
+(gnu + musl), Windows and macOS (x86_64 + arm64) and attaches them to a
+GitHub Release:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+See `.github/workflows/release.yml`. The server isn't shipped as a binary — it
+runs as a container. To build the client locally for a target, use
+`scripts/build-release.sh [target...]` (host target with cargo; others via
+[`cross`](https://github.com/cross-rs/cross)).
+
 ## Roadmap
 
 1. ✅ Auth + 1:1 DMs + presence
-2. Group chats & message history pagination
-3. Typing indicators / read receipts
+2. ✅ Group chats + user search
+3. Message history pagination; typing indicators / read receipts
 4. Bot tokens (bots are just clients with a bot credential)
 5. Voice calls: server-side signaling (SDP/ICE over `/ws`) + P2P media via
    WebRTC, with a TURN relay fallback

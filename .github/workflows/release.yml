@@ -1,0 +1,78 @@
+name: release
+
+# Push a version tag to build cross-platform client binaries and publish a
+# GitHub Release:  git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest }
+          - { target: x86_64-apple-darwin,       os: macos-latest }
+          - { target: aarch64-apple-darwin,      os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Only the client ships as a downloadable binary; the server is deployed
+      # as a container (see Dockerfile / swallow.yaml).
+      - name: Build client
+        run: cargo build --release -p client --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="clicord-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/clicord.exe" "dist/${name}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/clicord" "dist/${name}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

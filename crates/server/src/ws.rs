@@ -5,7 +5,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, DirectMessage, ServerMsg};
+use protocol::{ClientMsg, DirectMessage, GroupMessage, ServerMsg};
 use tokio::sync::mpsc;
 
 use crate::{auth, db, AppState};
@@ -55,9 +55,19 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
 
     let _ = tx.send(ServerMsg::AuthOk { username: username.clone() });
 
-    // Replay recent history so the client opens with context.
+    // Replay recent DM history so the client opens with context.
     if let Ok(history) = db::recent_for_user(&st.db, &username, 100).await {
         let _ = tx.send(ServerMsg::History { messages: history });
+    }
+
+    // Send the user's groups and recent group history.
+    if let Ok(groups) = db::groups_for_user(&st.db, &username).await {
+        for g in &groups {
+            if let Ok(messages) = db::recent_group_messages(&st.db, g.id, 100).await {
+                let _ = tx.send(ServerMsg::GroupHistory { group_id: g.id, messages });
+            }
+        }
+        let _ = tx.send(ServerMsg::Groups { groups });
     }
 
     // Send this client a snapshot of who is currently online.
@@ -164,6 +174,71 @@ async fn handle_client_msg(
             if to != username {
                 st.hub.send_to_user(username, ServerMsg::Dm(dm));
             }
+        }
+        ClientMsg::CreateGroup { name, mut members } => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                let _ = self_tx.send(ServerMsg::Error { message: "group name required".into() });
+                return true;
+            }
+            // The creator is always a member.
+            members.push(username.to_string());
+            members.sort();
+            members.dedup();
+
+            match db::create_group(&st.db, &name, &members).await {
+                Ok(info) => {
+                    // Notify every member (all their sessions).
+                    for m in &info.members {
+                        st.hub.send_to_user(m, ServerMsg::GroupCreated(info.clone()));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create group");
+                    let _ = self_tx.send(ServerMsg::Error { message: "failed to create group".into() });
+                }
+            }
+        }
+        ClientMsg::SendGroup { group_id, body } => {
+            if body.trim().is_empty() {
+                return true;
+            }
+            match db::is_member(&st.db, group_id, username).await {
+                Ok(true) => {}
+                _ => {
+                    let _ = self_tx.send(ServerMsg::Error { message: "not a member of that group".into() });
+                    return true;
+                }
+            }
+            let gm = GroupMessage {
+                group_id,
+                from: username.to_string(),
+                body,
+                ts: now_ms(),
+            };
+            if let Err(e) = db::store_group_message(&st.db, &gm).await {
+                tracing::warn!(error = %e, "failed to persist group message");
+                let _ = self_tx.send(ServerMsg::Error { message: "failed to store message".into() });
+                return true;
+            }
+            // Fan out to every member's sessions (includes the sender).
+            match db::group_members(&st.db, group_id).await {
+                Ok(members) => {
+                    for m in members {
+                        st.hub.send_to_user(&m, ServerMsg::GroupMsg(gm.clone()));
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to load group members"),
+            }
+        }
+        ClientMsg::SearchUsers { query } => {
+            let query = query.trim().to_string();
+            let users = if query.is_empty() {
+                Vec::new()
+            } else {
+                db::search_users(&st.db, &query, 20).await.unwrap_or_default()
+            };
+            let _ = self_tx.send(ServerMsg::SearchResults { query, users });
         }
     }
     true
