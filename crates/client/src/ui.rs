@@ -1,5 +1,6 @@
 //! All rendering. Widgets read from `App` and never mutate it.
 
+use protocol::{Attachment, DirectMessage, GroupMessage};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -8,6 +9,7 @@ use ratatui::Frame;
 
 use crate::app::{App, LoginField, LoginMode, Screen, Target};
 use crate::layout;
+use crate::media::{self, ImageArt};
 
 const ACCENT: Color = Color::Cyan;
 
@@ -215,20 +217,8 @@ fn render_chat(f: &mut Frame, app: &App) {
         l.peers,
     );
 
-    // Messages for the active conversation.
-    let lines: Vec<Line> = match &app.active {
-        None => Vec::new(),
-        Some(Target::Dm(peer)) => app
-            .dm_messages(peer)
-            .into_iter()
-            .map(|m| format_line(app, &m.from, &m.body, m.ts))
-            .collect(),
-        Some(Target::Group(id)) => app
-            .group_messages(*id)
-            .into_iter()
-            .map(|m| format_line(app, &m.from, &m.body, m.ts))
-            .collect(),
-    };
+    // Messages for the active conversation (with date separators & attachments).
+    let lines: Vec<Line> = chat_lines(app);
     let title = format!(" {} ", app.active_name());
     let visible = l.messages.height.saturating_sub(2) as usize;
     let total = lines.len();
@@ -376,7 +366,7 @@ fn opt(key: &'static str, label: &'static str) -> Span<'static> {
 
 fn render_help(f: &mut Frame) {
     let area = f.area();
-    let rect = centered_rect(70, 14, area);
+    let rect = centered_rect(70, 19, area);
     f.render_widget(Clear, rect);
 
     let line = |k: &str, v: &str| {
@@ -396,6 +386,8 @@ fn render_help(f: &mut Frame) {
         line("/find <prefix>", "search registered users"),
         line("/group <name> [users]", "create a group"),
         line("/g <name>", "open one of your groups"),
+        line("/file <path>", "send a file/image to the open chat"),
+        line("/view <n>", "open attachment n in its default app"),
         line("Tab", "autocomplete commands / names"),
         line("←/→ Home/End", "move caret · Del/Backspace edit"),
         line("PgUp/PgDn ↑/↓ wheel", "scroll history (sticks to newest)"),
@@ -441,7 +433,58 @@ fn set_field_cursor(f: &mut Frame, row: Rect, label: &str, cursor: usize) {
     f.set_cursor_position(Position::new(row.x + prefix + cursor as u16, row.y));
 }
 
-fn format_line(app: &App, from: &str, body: &str, ts: i64) -> Line<'static> {
+/// A message from either kind of conversation, flattened for uniform rendering.
+struct MsgView<'a> {
+    from: &'a str,
+    body: &'a str,
+    ts: i64,
+    attachment: Option<&'a Attachment>,
+}
+
+impl<'a> MsgView<'a> {
+    fn from_dm(m: &'a DirectMessage) -> Self {
+        Self { from: &m.from, body: &m.body, ts: m.ts, attachment: m.attachment.as_ref() }
+    }
+    fn from_group(m: &'a GroupMessage) -> Self {
+        Self { from: &m.from, body: &m.body, ts: m.ts, attachment: m.attachment.as_ref() }
+    }
+}
+
+/// Build every rendered line for the active conversation: a `[DD.MM.YY]`
+/// separator whenever the day changes, then each message, its attachment line
+/// and (for images) an inline thumbnail. Shared with `app` so scroll maths and
+/// rendering agree on the line count.
+pub fn chat_lines(app: &App) -> Vec<Line<'static>> {
+    let msgs: Vec<MsgView> = match &app.active {
+        None => return Vec::new(),
+        Some(Target::Dm(peer)) => app.dm_messages(peer).into_iter().map(MsgView::from_dm).collect(),
+        Some(Target::Group(id)) => app.group_messages(*id).into_iter().map(MsgView::from_group).collect(),
+    };
+
+    let mut lines = Vec::new();
+    let mut last_day: Option<String> = None;
+    let mut att_no = 0usize;
+    for m in msgs {
+        let day = day_label(m.ts);
+        if last_day.as_deref() != Some(day.as_str()) {
+            lines.push(date_separator(&day));
+            last_day = Some(day);
+        }
+        lines.push(message_line(app, m.from, m.body, m.ts));
+        if let Some(a) = m.attachment {
+            att_no += 1;
+            lines.push(attachment_line(att_no, a));
+            if a.is_image() {
+                if let Some(art) = app.image_art(a.id) {
+                    lines.extend(thumbnail_lines(art));
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn message_line(app: &App, from: &str, body: &str, ts: i64) -> Line<'static> {
     let who_style = if from == app.username {
         Style::default().fg(ACCENT)
     } else {
@@ -454,11 +497,64 @@ fn format_line(app: &App, from: &str, body: &str, ts: i64) -> Line<'static> {
     ])
 }
 
+/// A centered day divider, e.g. `──────  01.07.26  ──────`.
+fn date_separator(day: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("──────  {day}  ──────"),
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+    ))
+    .centered()
+}
+
+/// The line describing an attachment beneath its message.
+fn attachment_line(no: usize, att: &Attachment) -> Line<'static> {
+    let icon = if att.is_image() { "🖼" } else { "📎" };
+    Line::from(vec![
+        Span::styled(format!("    {icon} [{no}] "), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            att.name.clone(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ({})  ", media::human_size(att.size)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(format!("· /view {no}"), Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// Turn a decoded thumbnail into indented half-block lines.
+fn thumbnail_lines(art: &ImageArt) -> Vec<Line<'static>> {
+    art.rows
+        .iter()
+        .map(|row| {
+            let mut spans = vec![Span::raw("    ".to_string())];
+            spans.extend(row.iter().map(|cell| {
+                Span::styled(
+                    "▀".to_string(),
+                    Style::default()
+                        .fg(Color::Rgb(cell.top.0, cell.top.1, cell.top.2))
+                        .bg(Color::Rgb(cell.bottom.0, cell.bottom.1, cell.bottom.2)),
+                )
+            }));
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn format_ts(ms: i64) -> String {
     use chrono::{Local, TimeZone};
     match Local.timestamp_millis_opt(ms).single() {
         Some(dt) => dt.format("%H:%M").to_string(),
         None => "--:--".to_string(),
+    }
+}
+
+fn day_label(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(ms).single() {
+        Some(dt) => dt.format("%d.%m.%y").to_string(),
+        None => "??.??.??".to_string(),
     }
 }
 

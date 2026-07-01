@@ -21,3 +21,4 @@ crossterm.workspace = true
 tokio-tungstenite.workspace = true
 reqwest.workspace = true
 dirs.workspace = true
+image.workspace = true

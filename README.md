@@ -5,15 +5,16 @@ voice calls — with a server you can self-host on
 [samoswallow](https://github.com/Ureshipan/samoswallow).
 
 > Status: **early MVP.** Working today: registration/login, realtime 1:1
-> direct messages over websockets, presence, and a TUI client. Group chats,
-> bots and calls are on the roadmap.
+> direct messages over websockets, group chats, presence, file/image
+> attachments (with inline terminal image previews), persistent unread badges,
+> and a TUI client. Bots and calls are on the roadmap.
 
 ## Workspace layout
 
 ```
 crates/
   protocol/   # shared wire types (serde) — the single source of truth for the contract
-  server/     # axum: /health, /api/register, /api/login, /ws  + SQLite + in-memory routing hub
+  server/     # axum: /health, /api/{register,login,upload}, /api/attachment/:id, /ws + SQLite + in-memory routing hub
   client/     # ratatui + crossterm TUI client
 Dockerfile    # builds the server image
 swallow.yaml  # samoswallow deployment descriptor
@@ -56,7 +57,18 @@ In the client:
   `/g <name>` opens one (or **click a name** in the list — DMs and groups live
   there together). Type and `Enter` to send. `Tab` autocompletes commands,
   usernames and group names. Edit with `←/→`, `Home/End`, `Delete`. Unread chats
-  show a red badge. `Esc` or `/accounts` returns to the session manager.
+  show a red badge — including messages that arrived while you were **offline**
+  (the read position is tracked server-side, so badges survive restarts and stay
+  in sync across your devices). `Esc` or `/accounts` returns to the session
+  manager.
+- **Attachments:** `/file <path>` (alias `/attach`, `/f`) uploads a file or
+  image to the open chat — the rest of the line is the path, so spaces are fine.
+  Attachments show under the message with an index, name and size. Images get an
+  inline preview drawn with Unicode half-blocks (works on any truecolour
+  terminal — Windows, macOS, Linux — no sixel/kitty required). `/view <n>`
+  downloads attachment *n* and opens it in the OS's default application.
+- **Message history** groups messages by day: a `[DD.MM.YY]` divider separates
+  days, and each message still shows its send time.
 - **Scrollback:** `PgUp/PgDn`, `↑/↓` or the mouse wheel scroll the history. At
   the bottom it sticks to the newest message; scroll up and incoming messages
   no longer shift the view — a `▼ N new` marker appears instead, and the chat's

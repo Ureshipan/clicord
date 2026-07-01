@@ -70,6 +70,14 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
         let _ = tx.send(ServerMsg::Groups { groups });
     }
 
+    // Unread counts for anything that arrived while this user was away, so
+    // badges show up immediately on connect (not just for live messages).
+    if let Ok(counts) = db::unread_counts(&st.db, &username).await {
+        if !counts.is_empty() {
+            let _ = tx.send(ServerMsg::Unread { counts });
+        }
+    }
+
     // Send this client a snapshot of who is currently online.
     for other in st.hub.online_users() {
         if other != username {
@@ -151,8 +159,12 @@ async fn handle_client_msg(
         ClientMsg::Ping => {
             let _ = self_tx.send(ServerMsg::Pong);
         }
-        ClientMsg::SendDm { to, body } => {
-            if body.trim().is_empty() {
+        ClientMsg::SendDm { to, body, attachment } => {
+            let attachment = match resolve_attachment(st, self_tx, attachment).await {
+                Ok(a) => a,
+                Err(()) => return true,
+            };
+            if body.trim().is_empty() && attachment.is_none() {
                 return true;
             }
             let dm = DirectMessage {
@@ -160,6 +172,7 @@ async fn handle_client_msg(
                 to: to.clone(),
                 body,
                 ts: now_ms(),
+                attachment,
             };
 
             if let Err(e) = db::store_message(&st.db, &dm).await {
@@ -199,8 +212,12 @@ async fn handle_client_msg(
                 }
             }
         }
-        ClientMsg::SendGroup { group_id, body } => {
-            if body.trim().is_empty() {
+        ClientMsg::SendGroup { group_id, body, attachment } => {
+            let attachment = match resolve_attachment(st, self_tx, attachment).await {
+                Ok(a) => a,
+                Err(()) => return true,
+            };
+            if body.trim().is_empty() && attachment.is_none() {
                 return true;
             }
             match db::is_member(&st.db, group_id, username).await {
@@ -215,6 +232,7 @@ async fn handle_client_msg(
                 from: username.to_string(),
                 body,
                 ts: now_ms(),
+                attachment,
             };
             if let Err(e) = db::store_group_message(&st.db, &gm).await {
                 tracing::warn!(error = %e, "failed to persist group message");
@@ -229,6 +247,22 @@ async fn handle_client_msg(
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "failed to load group members"),
+            }
+        }
+        ClientMsg::MarkRead { peer, group_id } => {
+            let ts = now_ms();
+            match (group_id, peer) {
+                (Some(gid), _) => {
+                    if let Err(e) = db::mark_read_group(&st.db, username, gid, ts).await {
+                        tracing::warn!(error = %e, "failed to mark group read");
+                    }
+                }
+                (None, Some(p)) => {
+                    if let Err(e) = db::mark_read_dm(&st.db, username, &p, ts).await {
+                        tracing::warn!(error = %e, "failed to mark dm read");
+                    }
+                }
+                _ => {}
             }
         }
         ClientMsg::SearchUsers { query } => {
@@ -265,4 +299,27 @@ async fn handle_client_msg(
         }
     }
     true
+}
+
+/// Look up the metadata for an attachment id the client says it uploaded.
+/// `Ok(None)` when no attachment was referenced; `Err(())` when the id is
+/// unknown (an error has already been reported to the client).
+async fn resolve_attachment(
+    st: &AppState,
+    self_tx: &mpsc::UnboundedSender<ServerMsg>,
+    id: Option<i64>,
+) -> Result<Option<protocol::Attachment>, ()> {
+    let Some(id) = id else { return Ok(None) };
+    match db::attachment_meta(&st.db, id).await {
+        Ok(Some(a)) => Ok(Some(a)),
+        Ok(None) => {
+            let _ = self_tx.send(ServerMsg::Error { message: "unknown attachment".into() });
+            Err(())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load attachment");
+            let _ = self_tx.send(ServerMsg::Error { message: "failed to load attachment".into() });
+            Err(())
+        }
+    }
 }

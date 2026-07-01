@@ -38,6 +38,9 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dirs = "5"
+# Pure-Rust image decoding for inline terminal previews — common formats only,
+# no platform-specific backends, so it stays cross-platform.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [profile.release]
 opt-level = 2

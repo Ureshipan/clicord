@@ -2,7 +2,7 @@
 //! `query!` macros) so the project builds without a live database at compile time.
 
 use anyhow::Result;
-use protocol::{DirectMessage, GroupInfo, GroupMessage};
+use protocol::{Attachment, DirectMessage, GroupInfo, GroupMessage, UnreadCount};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 
@@ -88,7 +88,54 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_group_messages ON group_messages (group_id)")
         .execute(pool)
         .await?;
+
+    // File/image attachments. The bytes live here (BLOB) so a self-hosted
+    // deployment keeps everything in the single SQLite file / mounted volume.
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS attachments (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner      TEXT NOT NULL,
+            name       TEXT NOT NULL,
+            mime       TEXT NOT NULL,
+            size       INTEGER NOT NULL,
+            data       BLOB NOT NULL,
+            created_at INTEGER NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Link messages to an optional attachment. Added via ALTER so existing
+    // databases pick the column up without a destructive migration.
+    add_column_if_missing(pool, "messages", "attachment_id", "INTEGER").await?;
+    add_column_if_missing(pool, "group_messages", "attachment_id", "INTEGER").await?;
+
+    // Per-user, per-conversation read position, so unread badges survive across
+    // sessions and stay in sync across a user's devices. `conversation` is
+    // `dm:<peer>` for direct chats or `grp:<id>` for groups.
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS read_marks (
+            username     TEXT NOT NULL,
+            conversation TEXT NOT NULL,
+            last_read_ts INTEGER NOT NULL,
+            PRIMARY KEY (username, conversation)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+/// Add `column` to `table` if it isn't there yet. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so we tolerate the "duplicate column" error.
+async fn add_column_if_missing(pool: &SqlitePool, table: &str, column: &str, ty: &str) -> Result<()> {
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {ty}");
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => Ok(()),
+        // Already present — nothing to do.
+        Err(sqlx::Error::Database(e)) if e.message().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Return the persisted JWT signing secret, generating and storing a random
@@ -150,22 +197,36 @@ pub async fn password_hash(pool: &SqlitePool, username: &str) -> Result<Option<S
 }
 
 pub async fn store_message(pool: &SqlitePool, msg: &DirectMessage) -> Result<()> {
-    sqlx::query("INSERT INTO messages (sender, recipient, body, ts) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO messages (sender, recipient, body, ts, attachment_id) VALUES (?, ?, ?, ?, ?)")
         .bind(&msg.from)
         .bind(&msg.to)
         .bind(&msg.body)
         .bind(msg.ts)
+        .bind(msg.attachment.as_ref().map(|a| a.id))
         .execute(pool)
         .await?;
     Ok(())
 }
 
+/// A direct-message row joined with its optional attachment metadata.
+type DmRow = (String, String, String, i64, Option<i64>, Option<String>, Option<String>, Option<i64>);
+/// A group-message row joined with its optional attachment metadata.
+type GroupRow = (String, String, i64, Option<i64>, Option<String>, Option<String>, Option<i64>);
+
+fn attachment_from_cols(id: Option<i64>, name: Option<String>, mime: Option<String>, size: Option<i64>) -> Option<Attachment> {
+    match (id, name, mime, size) {
+        (Some(id), Some(name), Some(mime), Some(size)) => Some(Attachment { id, name, mime, size }),
+        _ => None,
+    }
+}
+
 /// Most recent messages this user is party to (sent or received), oldest first.
 pub async fn recent_for_user(pool: &SqlitePool, username: &str, limit: i64) -> Result<Vec<DirectMessage>> {
-    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
-        r#"SELECT sender, recipient, body, ts FROM messages
-           WHERE sender = ?1 OR recipient = ?1
-           ORDER BY ts DESC LIMIT ?2"#,
+    let rows: Vec<DmRow> = sqlx::query_as(
+        r#"SELECT m.sender, m.recipient, m.body, m.ts, a.id, a.name, a.mime, a.size
+           FROM messages m LEFT JOIN attachments a ON a.id = m.attachment_id
+           WHERE m.sender = ?1 OR m.recipient = ?1
+           ORDER BY m.ts DESC LIMIT ?2"#,
     )
     .bind(username)
     .bind(limit)
@@ -174,9 +235,127 @@ pub async fn recent_for_user(pool: &SqlitePool, username: &str, limit: i64) -> R
 
     let mut out: Vec<DirectMessage> = rows
         .into_iter()
-        .map(|(from, to, body, ts)| DirectMessage { from, to, body, ts })
+        .map(|(from, to, body, ts, aid, aname, amime, asize)| DirectMessage {
+            from,
+            to,
+            body,
+            ts,
+            attachment: attachment_from_cols(aid, aname, amime, asize),
+        })
         .collect();
     out.reverse(); // oldest first for replay
+    Ok(out)
+}
+
+// === Attachments ============================================================
+
+/// Store an uploaded file's bytes and return its metadata (with the new id).
+pub async fn store_attachment(
+    pool: &SqlitePool,
+    owner: &str,
+    name: &str,
+    mime: &str,
+    data: &[u8],
+) -> Result<Attachment> {
+    let size = data.len() as i64;
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO attachments (owner, name, mime, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(owner)
+    .bind(name)
+    .bind(mime)
+    .bind(size)
+    .bind(data)
+    .bind(chrono::Utc::now().timestamp())
+    .fetch_one(pool)
+    .await?;
+    Ok(Attachment { id, name: name.to_string(), mime: mime.to_string(), size })
+}
+
+/// Metadata for an attachment (no bytes), used to embed it in a message.
+pub async fn attachment_meta(pool: &SqlitePool, id: i64) -> Result<Option<Attachment>> {
+    let row: Option<(i64, String, String, i64)> =
+        sqlx::query_as("SELECT id, name, mime, size FROM attachments WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id, name, mime, size)| Attachment { id, name, mime, size }))
+}
+
+/// Fetch an attachment's bytes and (name, mime) for download.
+pub async fn attachment_bytes(pool: &SqlitePool, id: i64) -> Result<Option<(String, String, Vec<u8>)>> {
+    let row: Option<(String, String, Vec<u8>)> =
+        sqlx::query_as("SELECT name, mime, data FROM attachments WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
+}
+
+// === Read marks / unread ====================================================
+
+/// Advance a user's read position for a conversation (never moves it backwards).
+async fn mark_read(pool: &SqlitePool, username: &str, conversation: &str, ts: i64) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO read_marks (username, conversation, last_read_ts) VALUES (?1, ?2, ?3)
+           ON CONFLICT(username, conversation)
+           DO UPDATE SET last_read_ts = MAX(last_read_ts, excluded.last_read_ts)"#,
+    )
+    .bind(username)
+    .bind(conversation)
+    .bind(ts)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_read_dm(pool: &SqlitePool, username: &str, peer: &str, ts: i64) -> Result<()> {
+    mark_read(pool, username, &format!("dm:{peer}"), ts).await
+}
+
+pub async fn mark_read_group(pool: &SqlitePool, username: &str, group_id: i64, ts: i64) -> Result<()> {
+    mark_read(pool, username, &format!("grp:{group_id}"), ts).await
+}
+
+/// Count unread messages per conversation for `username`: incoming DMs and
+/// group messages (from others) newer than the stored read position.
+pub async fn unread_counts(pool: &SqlitePool, username: &str) -> Result<Vec<UnreadCount>> {
+    let mut out = Vec::new();
+
+    let dm_rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT m.sender, COUNT(*)
+           FROM messages m
+           LEFT JOIN read_marks r
+             ON r.username = ?1 AND r.conversation = 'dm:' || m.sender
+           WHERE m.recipient = ?1 AND m.sender <> ?1
+             AND m.ts > COALESCE(r.last_read_ts, 0)
+           GROUP BY m.sender"#,
+    )
+    .bind(username)
+    .fetch_all(pool)
+    .await?;
+    for (peer, count) in dm_rows {
+        out.push(UnreadCount { peer: Some(peer), group_id: None, count: count as u32 });
+    }
+
+    let grp_rows: Vec<(i64, i64)> = sqlx::query_as(
+        r#"SELECT gm.group_id, COUNT(*)
+           FROM group_messages gm
+           JOIN group_members mem
+             ON mem.group_id = gm.group_id AND mem.username = ?1
+           LEFT JOIN read_marks r
+             ON r.username = ?1 AND r.conversation = 'grp:' || gm.group_id
+           WHERE gm.sender <> ?1
+             AND gm.ts > COALESCE(r.last_read_ts, 0)
+           GROUP BY gm.group_id"#,
+    )
+    .bind(username)
+    .fetch_all(pool)
+    .await?;
+    for (group_id, count) in grp_rows {
+        out.push(UnreadCount { peer: None, group_id: Some(group_id), count: count as u32 });
+    }
+
     Ok(out)
 }
 
@@ -268,20 +447,22 @@ pub async fn groups_for_user(pool: &SqlitePool, username: &str) -> Result<Vec<Gr
 }
 
 pub async fn store_group_message(pool: &SqlitePool, msg: &GroupMessage) -> Result<()> {
-    sqlx::query("INSERT INTO group_messages (group_id, sender, body, ts) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO group_messages (group_id, sender, body, ts, attachment_id) VALUES (?, ?, ?, ?, ?)")
         .bind(msg.group_id)
         .bind(&msg.from)
         .bind(&msg.body)
         .bind(msg.ts)
+        .bind(msg.attachment.as_ref().map(|a| a.id))
         .execute(pool)
         .await?;
     Ok(())
 }
 
 pub async fn recent_group_messages(pool: &SqlitePool, group_id: i64, limit: i64) -> Result<Vec<GroupMessage>> {
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        r#"SELECT sender, body, ts FROM group_messages
-           WHERE group_id = ?1 ORDER BY ts DESC LIMIT ?2"#,
+    let rows: Vec<GroupRow> = sqlx::query_as(
+        r#"SELECT gm.sender, gm.body, gm.ts, a.id, a.name, a.mime, a.size
+           FROM group_messages gm LEFT JOIN attachments a ON a.id = gm.attachment_id
+           WHERE gm.group_id = ?1 ORDER BY gm.ts DESC LIMIT ?2"#,
     )
     .bind(group_id)
     .bind(limit)
@@ -290,7 +471,13 @@ pub async fn recent_group_messages(pool: &SqlitePool, group_id: i64, limit: i64)
 
     let mut out: Vec<GroupMessage> = rows
         .into_iter()
-        .map(|(from, body, ts)| GroupMessage { group_id, from, body, ts })
+        .map(|(from, body, ts, aid, aname, amime, asize)| GroupMessage {
+            group_id,
+            from,
+            body,
+            ts,
+            attachment: attachment_from_cols(aid, aname, amime, asize),
+        })
         .collect();
     out.reverse();
     Ok(out)

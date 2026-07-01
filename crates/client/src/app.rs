@@ -2,9 +2,10 @@
 //! (`ui.rs`), networking (`net.rs`) and persistence (`session.rs`).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use protocol::{ClientMsg, DirectMessage, GroupId, GroupInfo, GroupMessage, ServerMsg};
+use protocol::{Attachment, ClientMsg, DirectMessage, GroupId, GroupInfo, GroupMessage, ServerMsg};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -12,8 +13,14 @@ use tokio::sync::mpsc::UnboundedSender;
 const TYPING_TTL: Duration = Duration::from_secs(4);
 /// Minimum gap between typing signals we emit while the user keeps typing.
 const TYPING_THROTTLE: Duration = Duration::from_millis(1500);
+/// Only auto-download images below this size for inline previews.
+const MAX_PREVIEW_BYTES: i64 = 5 * 1024 * 1024;
+/// Maximum thumbnail size, in character cells (rows are two pixels tall).
+const PREVIEW_COLS: u32 = 40;
+const PREVIEW_ROWS: u32 = 12;
 
 use crate::input::TextInput;
+use crate::media::{self, ImageArt};
 use crate::net::{self, Incoming};
 use crate::session::{self, Account, Config, Store};
 use crate::layout;
@@ -52,7 +59,7 @@ struct PendingConn {
     token: String,
 }
 
-const COMMANDS: &[&str] = &["dm", "group", "g", "find", "accounts", "help", "quit"];
+const COMMANDS: &[&str] = &["dm", "group", "g", "find", "file", "view", "accounts", "help", "quit"];
 
 pub struct App {
     pub config: Config,
@@ -76,6 +83,8 @@ pub struct App {
     // chat
     pub username: String,
     pub server: String,
+    /// Bearer token for the active session, reused for attachment up/downloads.
+    token: String,
     pub authed: bool,
     pub active: Option<Target>,
     pub input: TextInput,
@@ -93,6 +102,10 @@ pub struct App {
     pub typing: BTreeMap<Target, BTreeMap<String, Instant>>,
     last_typing_sent: Option<Instant>,
     pending_group: Option<String>,
+    /// Decoded inline thumbnails, keyed by attachment id.
+    image_cache: BTreeMap<i64, ImageArt>,
+    /// Attachment ids whose preview download is already in flight or done.
+    previews_requested: BTreeSet<i64>,
 
     // autocomplete
     pub suggestions: Vec<String>,
@@ -141,6 +154,7 @@ impl App {
             password_input: TextInput::default(),
             username: String::new(),
             server: String::new(),
+            token: String::new(),
             authed: false,
             active: None,
             input: TextInput::default(),
@@ -155,6 +169,8 @@ impl App {
             typing: BTreeMap::new(),
             last_typing_sent: None,
             pending_group: None,
+            image_cache: BTreeMap::new(),
+            previews_requested: BTreeSet::new(),
             suggestions: Vec::new(),
             selected: None,
             pending: None,
@@ -396,16 +412,14 @@ impl App {
         m.height.saturating_sub(2) as usize
     }
 
-    fn active_msg_count(&self) -> usize {
-        match &self.active {
-            Some(Target::Dm(p)) => self.dm_messages(p).len(),
-            Some(Target::Group(id)) => self.group_messages(*id).len(),
-            None => 0,
-        }
+    /// Number of rendered lines for the active chat (messages, date separators
+    /// and inline thumbnail rows), so scrolling stays in step with the view.
+    fn active_line_count(&self) -> usize {
+        crate::ui::chat_lines(self).len()
     }
 
     fn scroll_up(&mut self, step: usize) {
-        let max = self.active_msg_count().saturating_sub(self.msg_viewport().max(1));
+        let max = self.active_line_count().saturating_sub(self.msg_viewport().max(1));
         self.scroll = (self.scroll + step).min(max);
     }
 
@@ -413,7 +427,7 @@ impl App {
         self.scroll = self.scroll.saturating_sub(step);
         if self.scroll == 0 {
             if let Some(t) = self.active.clone() {
-                self.unread.remove(&t);
+                self.mark_read(&t);
             }
         }
     }
@@ -457,14 +471,14 @@ impl App {
         };
         if let Some(tx) = &self.out_tx {
             let msg = match &target {
-                Target::Dm(peer) => ClientMsg::SendDm { to: peer.clone(), body: line },
-                Target::Group(id) => ClientMsg::SendGroup { group_id: *id, body: line },
+                Target::Dm(peer) => ClientMsg::SendDm { to: peer.clone(), body: line, attachment: None },
+                Target::Group(id) => ClientMsg::SendGroup { group_id: *id, body: line, attachment: None },
             };
             let _ = tx.send(msg);
         }
         // Sending jumps back to the newest message.
         self.scroll = 0;
-        self.unread.remove(&target);
+        self.mark_read(&target);
     }
 
     fn handle_command(&mut self, cmd: &str) {
@@ -501,6 +515,15 @@ impl App {
                     self.status = "searching…".into();
                 }
             }
+            // The whole remainder is the path, so names with spaces work.
+            Some("file") | Some("attach") | Some("f") => {
+                let path = cmd.split_once(char::is_whitespace).map(|(_, r)| r).unwrap_or("");
+                self.send_file(path);
+            }
+            Some("view") | Some("open-file") => match parts.next() {
+                Some(n) => self.open_attachment(n),
+                None => self.status = "usage: /view <n> (opens attachment n externally)".into(),
+            },
             Some("accounts") | Some("sessions") => self.go_to_accounts(),
             Some("quit") | Some("q") => self.should_quit = true,
             Some("help") => self.show_help = true,
@@ -511,7 +534,7 @@ impl App {
     fn open_dm(&mut self, user: String) {
         self.peers.insert(user.clone());
         let t = Target::Dm(user.clone());
-        self.unread.remove(&t);
+        self.mark_read(&t);
         self.active = Some(t);
         self.scroll = 0;
         self.status = format!("now chatting with {user}");
@@ -519,7 +542,7 @@ impl App {
 
     fn open_group(&mut self, id: GroupId) {
         let t = Target::Group(id);
-        self.unread.remove(&t);
+        self.mark_read(&t);
         let name = self.groups.get(&id).map(|g| g.name.clone()).unwrap_or_default();
         self.active = Some(t);
         self.scroll = 0;
@@ -531,6 +554,149 @@ impl App {
             Some(id) => self.open_group(id),
             None => self.status = format!("no group named #{name}"),
         }
+    }
+
+    // --- Attachments --------------------------------------------------------
+
+    /// Mark a conversation read locally and persist that on the server so the
+    /// badge doesn't come back on the next connect (and clears on other devices).
+    fn mark_read(&mut self, t: &Target) {
+        self.unread.remove(t);
+        if let Some(tx) = &self.out_tx {
+            let msg = match t {
+                Target::Dm(peer) => ClientMsg::MarkRead { peer: Some(peer.clone()), group_id: None },
+                Target::Group(id) => ClientMsg::MarkRead { peer: None, group_id: Some(*id) },
+            };
+            let _ = tx.send(msg);
+        }
+    }
+
+    /// Upload `raw` (a file path) and send it as an attachment to the active chat.
+    fn send_file(&mut self, raw: &str) {
+        let path = raw.trim().trim_matches('"').trim();
+        if path.is_empty() {
+            self.status = "usage: /file <path>".into();
+            return;
+        }
+        let Some(target) = self.active.clone() else {
+            self.status = "open a chat first — /dm <user> or /g <group>".into();
+            return;
+        };
+        if self.out_tx.is_none() {
+            return;
+        }
+        let pathbuf = PathBuf::from(path);
+        if !pathbuf.is_file() {
+            self.status = format!("no such file: {path}");
+            return;
+        }
+        let name = pathbuf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        self.status = format!("uploading {name}…");
+
+        let server = self.server.clone();
+        let token = self.token.clone();
+        let in_tx = self.in_tx.clone();
+        let out_tx = self.out_tx.clone();
+        tokio::spawn(async move {
+            match net::upload(&server, &token, &pathbuf).await {
+                Ok(att) => {
+                    if let Some(tx) = out_tx {
+                        let msg = match target {
+                            Target::Dm(peer) => ClientMsg::SendDm {
+                                to: peer,
+                                body: String::new(),
+                                attachment: Some(att.id),
+                            },
+                            Target::Group(id) => ClientMsg::SendGroup {
+                                group_id: id,
+                                body: String::new(),
+                                attachment: Some(att.id),
+                            },
+                        };
+                        let _ = tx.send(msg);
+                    }
+                    let _ = in_tx.send(Incoming::Notice(format!("sent {}", att.name)));
+                }
+                Err(e) => {
+                    let _ = in_tx.send(Incoming::Notice(format!("upload failed: {e}")));
+                }
+            }
+        });
+    }
+
+    /// Attachments in the active conversation, oldest first — the order the UI
+    /// numbers them so `/view <n>` lines up with what's on screen.
+    fn active_attachments(&self) -> Vec<Attachment> {
+        match &self.active {
+            Some(Target::Dm(p)) => self.dm_messages(p).into_iter().filter_map(|m| m.attachment.clone()).collect(),
+            Some(Target::Group(id)) => self.group_messages(*id).into_iter().filter_map(|m| m.attachment.clone()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Download attachment `nth` (1-based) and open it with the OS default app.
+    fn open_attachment(&mut self, nth: &str) {
+        let Ok(n) = nth.parse::<usize>() else {
+            self.status = "usage: /view <n>".into();
+            return;
+        };
+        let atts = self.active_attachments();
+        let Some(att) = n.checked_sub(1).and_then(|i| atts.get(i)).cloned() else {
+            self.status = format!("no attachment #{n} here");
+            return;
+        };
+        self.status = format!("opening {}…", att.name);
+
+        let server = self.server.clone();
+        let token = self.token.clone();
+        let in_tx = self.in_tx.clone();
+        tokio::spawn(async move {
+            let note = match net::download(&server, &token, att.id).await {
+                Ok(bytes) => match cache_attachment(att.id, &att.name, &bytes) {
+                    Ok(path) => match media::open_external(&path) {
+                        Ok(_) => format!("opened {}", att.name),
+                        Err(e) => format!("cannot open: {e}"),
+                    },
+                    Err(e) => format!("cannot save: {e}"),
+                },
+                Err(e) => format!("download failed: {e}"),
+            };
+            let _ = in_tx.send(Incoming::Notice(note));
+        });
+    }
+
+    /// Kick off a background thumbnail download for an image attachment.
+    fn maybe_preview(&mut self, att: &Option<Attachment>) {
+        if let Some(a) = att {
+            if a.is_image() && a.size <= MAX_PREVIEW_BYTES {
+                self.request_preview(a.id);
+            }
+        }
+    }
+
+    fn request_preview(&mut self, id: i64) {
+        if self.image_cache.contains_key(&id) || !self.previews_requested.insert(id) {
+            return;
+        }
+        let server = self.server.clone();
+        let token = self.token.clone();
+        let in_tx = self.in_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(bytes) = net::download(&server, &token, id).await {
+                if let Some(art) = media::render_thumbnail(&bytes, PREVIEW_COLS, PREVIEW_ROWS) {
+                    let _ = in_tx.send(Incoming::Preview { id, art });
+                }
+            }
+        });
+    }
+
+    /// A decoded thumbnail for an attachment, if one has been downloaded.
+    pub fn image_art(&self, id: i64) -> Option<&ImageArt> {
+        self.image_cache.get(&id)
     }
 
     // --- Connection error screen -------------------------------------------
@@ -692,6 +858,10 @@ impl App {
                     self.enter_conn_error(m);
                 }
             }
+            Incoming::Notice(m) => self.status = m,
+            Incoming::Preview { id, art } => {
+                self.image_cache.insert(id, art);
+            }
         }
     }
 
@@ -704,17 +874,20 @@ impl App {
             ServerMsg::History { messages } => {
                 for m in messages {
                     self.note_peer(&m);
+                    self.maybe_preview(&m.attachment);
                     self.messages.push(m);
                 }
             }
             ServerMsg::Dm(m) => {
                 self.note_peer(&m);
+                self.maybe_preview(&m.attachment);
                 let from_self = m.from == self.username;
                 let t = Target::Dm(self.other_party(&m));
                 self.messages.push(m);
                 if self.active.is_none() {
-                    self.active = Some(t);
+                    self.active = Some(t.clone());
                     self.scroll = 0;
+                    self.mark_read(&t);
                 } else {
                     self.bump_for_incoming(t, from_self);
                 }
@@ -736,13 +909,32 @@ impl App {
                 }
             }
             ServerMsg::GroupMsg(gm) => {
+                self.maybe_preview(&gm.attachment);
                 let from_self = gm.from == self.username;
                 let t = Target::Group(gm.group_id);
                 self.group_messages.push(gm);
                 self.bump_for_incoming(t, from_self);
             }
             ServerMsg::GroupHistory { messages, .. } => {
+                for m in &messages {
+                    self.maybe_preview(&m.attachment);
+                }
                 self.group_messages.extend(messages);
+            }
+            ServerMsg::Unread { counts } => {
+                for c in counts {
+                    let t = match (c.group_id, c.peer) {
+                        (Some(id), _) => Target::Group(id),
+                        (None, Some(peer)) => {
+                            self.peers.insert(peer.clone());
+                            Target::Dm(peer)
+                        }
+                        _ => continue,
+                    };
+                    if c.count > 0 {
+                        self.unread.insert(t, c.count);
+                    }
+                }
             }
             ServerMsg::Typing { from, group_id } => {
                 let t = match group_id {
@@ -807,6 +999,10 @@ impl App {
                 if !from_self {
                     *self.unread.entry(t).or_insert(0) += 1;
                 }
+            } else {
+                // Sitting at the bottom — the message is seen, so advance the
+                // persisted read position (keeps offline unread counts correct).
+                self.mark_read(&t);
             }
         } else if !from_self {
             *self.unread.entry(t).or_insert(0) += 1;
@@ -895,6 +1091,7 @@ impl App {
         });
         self.username = username;
         self.server = server.clone();
+        self.token = token.clone();
         self.authed = false;
         self.auth_failed = false;
         self.active = None;
@@ -909,6 +1106,8 @@ impl App {
         self.typing.clear();
         self.last_typing_sent = None;
         self.pending_group = None;
+        self.image_cache.clear();
+        self.previews_requested.clear();
         self.input.clear();
         self.suggestions.clear();
         self.selected = None;
@@ -952,6 +1151,25 @@ fn edit_key(field: &mut TextInput, key: KeyEvent, ctrl: bool) -> bool {
         }
         _ => false,
     }
+}
+
+/// Write attachment bytes to a per-user cache dir and return the file path,
+/// so it can be handed to the OS's default application. Cross-platform via
+/// `dirs::cache_dir()`.
+fn cache_attachment(id: i64, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("clicord")
+        .join("attachments");
+    std::fs::create_dir_all(&dir)?;
+    // Prefix with the id so distinct attachments that share a name don't clash.
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{id}_{safe}"));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 fn normalize_server(raw: &str) -> Option<String> {
@@ -1018,6 +1236,7 @@ mod tests {
             to: "me".into(),
             body: "hi".into(),
             ts: 0,
+            attachment: None,
         }));
         assert_eq!(a.unread.get(&Target::Dm("alice".into())), Some(&1));
         a.open_dm("alice".into());
@@ -1049,6 +1268,7 @@ mod tests {
             to: "me".into(),
             body: "x".into(),
             ts: 0,
+            attachment: None,
         }));
         // View anchored (scroll grew with the message) and unread counted.
         assert_eq!(a.scroll, 4);
@@ -1066,6 +1286,7 @@ mod tests {
             to: "me".into(),
             body: "x".into(),
             ts: 0,
+            attachment: None,
         }));
         assert_eq!(a.scroll, 0);
         assert_eq!(a.unread.get(&Target::Dm("bob".into())), None);
@@ -1081,6 +1302,35 @@ mod tests {
     }
 
     #[test]
+    fn unread_frame_populates_badges_offline() {
+        let mut a = test_app();
+        a.username = "me".into();
+        a.on_server_msg(ServerMsg::Unread {
+            counts: vec![
+                protocol::UnreadCount { peer: Some("alice".into()), group_id: None, count: 3 },
+                protocol::UnreadCount { peer: None, group_id: Some(5), count: 1 },
+            ],
+        });
+        assert_eq!(a.unread.get(&Target::Dm("alice".into())), Some(&3));
+        assert_eq!(a.unread.get(&Target::Group(5)), Some(&1));
+        // The peer shows up in the sidebar even without live history.
+        assert!(a.peers.contains("alice"));
+    }
+
+    #[test]
+    fn chat_lines_separate_messages_by_day() {
+        let mut a = test_app();
+        a.username = "me".into();
+        a.active = Some(Target::Dm("bob".into()));
+        let day = 86_400_000i64;
+        a.messages.push(DirectMessage { from: "bob".into(), to: "me".into(), body: "a".into(), ts: day, attachment: None });
+        a.messages.push(DirectMessage { from: "me".into(), to: "bob".into(), body: "b".into(), ts: day * 3, attachment: None });
+        let lines = crate::ui::chat_lines(&a);
+        // one separator per distinct day + one line per message
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
     fn group_unread_when_not_active() {
         let mut a = test_app();
         a.username = "me".into();
@@ -1091,6 +1341,7 @@ mod tests {
             from: "alice".into(),
             body: "yo".into(),
             ts: 0,
+            attachment: None,
         }));
         assert_eq!(a.unread.get(&Target::Group(3)), Some(&1));
     }

@@ -7,6 +7,7 @@
 mod app;
 mod input;
 mod layout;
+mod media;
 mod net;
 mod session;
 mod ui;

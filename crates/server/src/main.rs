@@ -10,10 +10,14 @@ mod hub;
 mod http;
 mod ws;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+
+/// Maximum size of a single uploaded attachment.
+const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -62,6 +66,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/api/register", post(http::register))
         .route("/api/login", post(http::login))
+        .route(
+            "/api/upload",
+            post(http::upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
+        .route("/api/attachment/:id", get(http::download))
         .route("/ws", get(ws::ws_handler))
         .with_state(state);
 

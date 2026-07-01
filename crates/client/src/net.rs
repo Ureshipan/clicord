@@ -6,10 +6,13 @@
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{AuthRequest, AuthResponse, ClientMsg, ServerMsg};
+use protocol::{Attachment, AuthRequest, AuthResponse, ClientMsg, ServerMsg};
+use std::path::Path;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+use crate::media::{self, ImageArt};
 
 /// Events the websocket task delivers to the UI. Separating transport-level
 /// outcomes from protocol frames lets the UI react to drops and failures.
@@ -20,6 +23,10 @@ pub enum Incoming {
     ConnectFailed(String),
     /// An established connection was lost.
     Disconnected(String),
+    /// A one-off status line from a background task (upload/download result).
+    Notice(String),
+    /// A decoded inline thumbnail for an image attachment.
+    Preview { id: i64, art: ImageArt },
 }
 
 /// Perform `POST /api/{login,register}` and return the issued token.
@@ -40,6 +47,48 @@ pub async fn auth(server: &str, path: &str, username: &str, password: &str) -> R
         return Err(anyhow!("{code}: {body}"));
     }
     Ok(resp.json::<AuthResponse>().await?)
+}
+
+/// Upload a local file as an attachment and return its stored metadata.
+pub async fn upload(server: &str, token: &str, path: &Path) -> Result<Attachment> {
+    let bytes = tokio::fs::read(path).await.map_err(|e| anyhow!("cannot read file: {e}"))?;
+    if bytes.is_empty() {
+        return Err(anyhow!("file is empty"));
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let mime = media::guess_mime(path);
+    let url = format!("{}/api/upload", server.trim_end_matches('/'));
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(token)
+        .query(&[("name", name.as_str()), ("mime", mime.as_str())])
+        .body(bytes)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("{code}: {body}"));
+    }
+    Ok(resp.json::<Attachment>().await?)
+}
+
+/// Download an attachment's bytes by id.
+pub async fn download(server: &str, token: &str, id: i64) -> Result<Vec<u8>> {
+    let url = format!("{}/api/attachment/{}", server.trim_end_matches('/'), id);
+    let resp = reqwest::Client::new().get(&url).bearer_auth(token).send().await?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("{code}: {body}"));
+    }
+    Ok(resp.bytes().await?.to_vec())
 }
 
 /// Spawn the websocket task. Returns a channel for sending `ClientMsg`s; the
