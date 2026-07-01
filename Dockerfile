@@ -4,10 +4,22 @@
 # ---- build stage ----
 FROM rust:1-bookworm AS build
 WORKDIR /app
+
+# Some build hosts can't reach crates.io's CDN (CloudFront) — the index
+# download just times out. Probe it once and, if unreachable, switch cargo to
+# a mirror of both the sparse index and the .crate downloads. Safe against
+# tampering: cargo verifies every package checksum from Cargo.lock either way.
+ARG CRATES_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/
+RUN if ! curl -fsS --max-time 10 -o /dev/null https://index.crates.io/config.json; then \
+        echo "crates.io unreachable — falling back to ${CRATES_MIRROR}"; \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s"\n\n[net]\nretry = 5\n' \
+            "${CRATES_MIRROR}" >> "${CARGO_HOME}/config.toml"; \
+    fi
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # Build only the server binary (the TUI client is not deployed server-side).
-RUN cargo build --release -p server
+RUN cargo build --release --locked -p server
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
